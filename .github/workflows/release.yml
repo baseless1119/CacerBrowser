@@ -187,24 +187,43 @@ jobs:
           retention-days: 14
 
   publish:
-    # Ref prefixes are always populated on push events; do not depend on
-    # github.ref_type here, which can evaluate empty during tag runs.
-    if: startsWith(github.ref, 'refs/tags/')
+    # Tag runs in this repository report an empty github.ref/ref_type at job
+    # level, so both `startsWith(github.ref, 'refs/tags/')` and
+    # `github.ref_type == 'tag'` silently skipped publishing. The webhook
+    # payload ref is always populated for tag pushes; resolve the tag in a
+    # step and publish only when it is one.
+    if: needs.build.result == 'success'
     needs: build
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - name: Resolve release tag
+        id: tag
+        shell: bash
+        run: |
+          candidate="${{ github.event.ref }}"
+          if [ -z "$candidate" ]; then candidate="${{ github.ref }}"; fi
+          if [ -z "$candidate" ]; then candidate="${{ github.ref_name }}"; fi
+          case "$candidate" in
+            refs/tags/*) tag="${candidate#refs/tags/}" ;;
+            v[0-9]*) tag="$candidate" ;;
+            *) tag="" ;;
+          esac
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
       - uses: actions/download-artifact@v4
+        if: steps.tag.outputs.tag != ''
         with:
           name: Cacer-${{ needs.build.outputs.version }}-windows-x64
           path: release-assets
 
       - name: Publish versioned GitHub Release
+        if: steps.tag.outputs.tag != ''
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ steps.tag.outputs.tag }}
           RELEASE_VERSION: ${{ needs.build.outputs.version }}
         run: |
           gh release create "$RELEASE_TAG" release-assets/* \
