@@ -53,6 +53,11 @@ jobs:
     timeout-minutes: 90
     outputs:
       version: ${{ steps.version.outputs.version }}
+    # The Windows runner's console defaults to cp1252; helper scripts print
+    # Chinese progress lines, so force UTF-8 for every Python invocation.
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: utf-8
     defaults:
       run:
         shell: pwsh
