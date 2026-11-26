@@ -68,3 +68,14 @@ def test_font_preview_matches_repeated_draw_without_changing_identity():
     assert first
     assert required_font_families(identity) == first
     assert identity.to_dict() == original
+
+
+def test_font_preview_accepts_subscription_proxy_without_starting_core():
+    # Subscription identities have no proxy_server until launch starts mihomo.
+    # The read-only preview must still resolve fonts instead of demanding one.
+    from core.identity import create_identity
+    from core.launcher import required_font_families
+    identity = create_identity(
+        name="Font proxy check", os="macos", country="JP",
+        network_mode="proxy", proxy_source="demo.yaml", proxy_node="node-a")
+    assert required_font_families(identity)

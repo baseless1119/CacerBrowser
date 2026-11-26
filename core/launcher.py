@@ -270,9 +270,19 @@ def required_font_families(identity) -> list[str]:
     from camoufox.utils import launch_options
     from camoufox.addons import DefaultAddons
 
+    # Subscription routing is resolved right before launch, when the shared
+    # mihomo core has a listener port. The preview never connects and drops the
+    # proxy below, so a placeholder keeps validation from rejecting a valid
+    # subscription-backed identity without starting the core.
+    preview_proxy = None
+    if identity.network_mode == "proxy" and not identity.proxy_server:
+        preview_proxy = "socks5://127.0.0.1:9"
+
     import tempfile
     with tempfile.TemporaryDirectory(prefix="cacer-font-preview-") as temporary:
-        options = build_launch_options(copy.deepcopy(identity), profiles_dir=Path(temporary))
+        options = build_launch_options(
+            copy.deepcopy(identity), profiles_dir=Path(temporary),
+            proxy_override=preview_proxy)
     options["addons"] = []
     options["exclude_addons"] = list(DefaultAddons)
     options.pop("proxy", None)
