@@ -1254,7 +1254,24 @@ def cmd_run(args):
                 engine = getattr(browser, "browser", None)
                 if engine is not None:
                     while engine.is_connected():
-                        time.sleep(0.5)
+                        # Keep servicing the Playwright connection. An idle
+                        # client keeps queueing protocol events (console
+                        # messages from script-heavy pages such as Google's
+                        # sign-in flow) until the pipe fills and the browser's
+                        # main thread blocks: typing, navigation and even the
+                        # window's remote commands all hang. A client-side
+                        # wait drains those events without touching the page.
+                        try:
+                            live = [p for p in browser.pages if not p.is_closed()]
+                        except Exception:
+                            live = []
+                        if live:
+                            try:
+                                live[0].wait_for_timeout(250)
+                            except Exception:
+                                time.sleep(0.5)
+                        else:
+                            time.sleep(0.5)
                 else:
                     # Fallback for engines that do not expose context.browser.
                     # The startup page may be replaced, so inspect all pages.
