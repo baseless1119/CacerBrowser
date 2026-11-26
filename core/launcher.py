@@ -392,6 +392,12 @@ def build_launch_options(
         # proxy (type=5), or a saved profile proxy. Pin direct mode on every
         # launch, both through Camoufox and the persistent user.js below.
         user_prefs["network.proxy.type"] = 0
+    if identity.network_mode == "proxy" or proxy_override:
+        # Two safety pins for proxied environments. A dead listener must fail
+        # closed instead of quietly connecting from the host IP, and socks
+        # lookups must happen at the proxy: local DNS is frequently poisoned.
+        user_prefs["network.proxy.failover_direct"] = False
+        user_prefs["network.proxy.socks_remote_dns"] = True
     options["firefox_user_prefs"] = user_prefs
     # And write the same pins to user.js ourselves: Playwright's
     # writePreferences does not run on every launch, so the file (and the

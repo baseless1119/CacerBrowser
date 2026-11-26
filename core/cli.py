@@ -158,12 +158,17 @@ def _process_snapshot() -> Optional[Set[int]]:
         )
     except Exception:
         return None
+    # A failed or empty tasklist run must not look like "no processes exist":
+    # every live identity would be pruned in one tick, releasing the proxy
+    # listener under an open browser and leaving every page hanging.
+    if out.returncode != 0:
+        return None
     pids: Set[int] = set()
     for line in out.stdout.splitlines():
         row = next(csv.reader([line]), [])
         if len(row) >= 2 and row[1].strip().isdigit():
             pids.add(int(row[1]))
-    return pids
+    return pids or None
 
 
 def _process_start_time(pid: int) -> Optional[int]:
@@ -220,9 +225,13 @@ def _pid_alive(pid: int, snapshot: Optional[Set[int]] = None) -> bool:
             ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
             capture_output=True, text=True, timeout=10,
         )
+        if out.returncode != 0:
+            # Cannot verify liveness: assume alive. Declaring a live helper
+            # dead releases its proxy listener and hangs its browser.
+            return True
         return str(pid) in out.stdout
     except Exception:
-        return False
+        return True
 
 
 def _release_proxy(profiles_dir: Path, identity_id: str, state: Optional[Dict[str, Any]]) -> None:
@@ -402,6 +411,47 @@ def _kill_tree(pid: int, exclude: Optional[Set[int]] = None) -> bool:
     for target in targets:
         args.extend(["/PID", str(target)])
     return subprocess.run(args, capture_output=True, text=True).returncode == 0
+
+
+def _profile_browser_pids(profile_dir: Path) -> List[int]:
+    """PIDs of browser processes still attached to this profile (Windows)."""
+    if os.name != "nt" or not profile_dir.is_dir():
+        return []
+    # Pass the profile path through the environment: with `-Command`, anything
+    # after the script string is parsed as extra PowerShell commands, so
+    # `$args[0]` never receives it and the whole query fails.
+    script = (
+        "Get-CimInstance Win32_Process -Filter \"Name='camoufox.exe'\" | "
+        "Where-Object { $_.CommandLine -and "
+        "($_.CommandLine.IndexOf($env:CACER_PROFILE_MATCH, "
+        "[System.StringComparison]::OrdinalIgnoreCase) -ge 0) } | "
+        "ForEach-Object { $_.ProcessId }"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+            capture_output=True, text=True, timeout=20,
+            env={**os.environ, "CACER_PROFILE_MATCH": str(profile_dir)},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    pids: List[int] = []
+    for line in result.stdout.splitlines():
+        value = line.strip()
+        if value.isdigit():
+            pids.append(int(value))
+    return pids
+
+
+def _reap_orphan_browsers(profiles_dir: Path, identity_id: str) -> None:
+    """Close windows left behind by a dead helper.
+
+    Such a window still points at the proxy port of the instance that owned
+    it. Once that helper is gone the listener is gone too, so every page hangs
+    forever. Reap those processes before a fresh helper takes over the profile.
+    """
+    for pid in _profile_browser_pids(Path(profiles_dir) / identity_id / "profile"):
+        _kill_tree(pid, set())
 
 
 def _tail_log(path: Path, lines: int = 12) -> str:
@@ -994,6 +1044,8 @@ def cmd_launch(args):
     if not ident_file.is_file():
         print(json.dumps({"error": f"no such identity {args.id}"}, ensure_ascii=False))
         return 1
+
+    _reap_orphan_browsers(profiles_dir, args.id)
 
     # Detached helper owns the browser; we only supervise it via runtime.json.
     # Its output goes to a per-identity helper.log so failures are inspectable.
