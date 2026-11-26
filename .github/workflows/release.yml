@@ -187,7 +187,9 @@ jobs:
           retention-days: 14
 
   publish:
-    if: github.ref_type == 'tag'
+    # Ref prefixes are always populated on push events; do not depend on
+    # github.ref_type here, which can evaluate empty during tag runs.
+    if: startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
     permissions:
