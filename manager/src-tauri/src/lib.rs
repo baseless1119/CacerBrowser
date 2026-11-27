@@ -78,16 +78,6 @@ fn launcher_paths(text: &str) -> Vec<PathBuf> {
         .collect()
 }
 
-fn launcher_python() -> Option<PathBuf> {
-    let output = silent_command("py").arg("-0p").output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    launcher_paths(&String::from_utf8_lossy(&output.stdout))
-        .into_iter()
-        .find(|path| path.is_file())
-}
-
 /// `HKEY_*\SOFTWARE\Python\PythonCore\<version>\InstallPath` records every
 /// python.org install. Reading it covers interpreters installed without the
 /// launcher or without a PATH entry.
@@ -118,50 +108,71 @@ fn registry_paths(text: &str) -> Vec<PathBuf> {
     paths
 }
 
-fn registry_python() -> Option<PathBuf> {
-    for hive in ["HKCU", "HKLM"] {
-        for key in [
-            "SOFTWARE\\Python\\PythonCore",
-            "SOFTWARE\\WOW6432Node\\Python\\PythonCore",
-        ] {
-            let output = match silent_command("reg")
-                .args(["query", &format!("{hive}\\{key}"), "/s"])
-                .output()
-            {
-                Ok(output) if output.status.success() => output,
-                _ => continue,
-            };
-            if let Some(path) = registry_paths(&String::from_utf8_lossy(&output.stdout))
-                .into_iter()
-                .find(|path| path.is_file())
-            {
-                return Some(path);
-            }
-        }
+fn is_windows_store_stub(path: &std::path::Path) -> bool {
+    path.to_string_lossy()
+        .to_ascii_lowercase()
+        .contains("\\microsoft\\windowsapps\\")
+}
+
+fn where_pythons() -> Vec<PathBuf> {
+    let Ok(output) = silent_command("where").arg("python").output() else {
+        return Vec::new();
+    };
+    if !output.status.success() {
+        return Vec::new();
     }
-    None
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(PathBuf::from)
+        .filter(|path| path.is_file() && !is_windows_store_stub(path))
+        .collect()
 }
 
 /// Standard installer locations, newest first, as the last resort for machines
 /// that have neither the launcher nor registry entries available.
 fn installed_python_dirs() -> Vec<PathBuf> {
     let mut roots = Vec::new();
+    let mut direct_candidates = Vec::new();
     if let Ok(local) = std::env::var("LOCALAPPDATA") {
-        roots.push(PathBuf::from(&local).join("Programs").join("Python"));
-        roots.push(PathBuf::from(local).join("Python"));
+        let local_path = PathBuf::from(&local);
+        roots.push(local_path.join("Programs").join("Python"));
+        roots.push(local_path.join("Python"));
+        for conda in ["miniconda3", "anaconda3", "Miniconda3", "Anaconda3"] {
+            direct_candidates.push(local_path.join(conda).join("python.exe"));
+        }
     }
-    for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
+    if let Ok(profile) = std::env::var("USERPROFILE") {
+        let profile_path = PathBuf::from(&profile);
+        for conda in ["miniconda3", "anaconda3", "Miniconda3", "Anaconda3", "mambaforge", "miniforge3"] {
+            direct_candidates.push(profile_path.join(conda).join("python.exe"));
+        }
+        roots.push(profile_path.join(".pyenv").join("pyenv-win").join("versions"));
+    }
+    for variable in ["ProgramFiles", "ProgramFiles(x86)", "ProgramData"] {
         if let Ok(base) = std::env::var(variable) {
-            roots.push(PathBuf::from(base));
+            let base_path = PathBuf::from(base);
+            roots.push(base_path.clone());
+            for conda in ["miniconda3", "anaconda3", "Miniconda3", "Anaconda3"] {
+                direct_candidates.push(base_path.join(conda).join("python.exe"));
+            }
         }
     }
     roots.push(PathBuf::from("C:\\"));
     let mut found = Vec::new();
+    for executable in direct_candidates {
+        if executable.is_file() {
+            found.push(executable);
+        }
+    }
     for root in roots {
         let Ok(entries) = std::fs::read_dir(&root) else { continue };
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
-            if !(name.starts_with("python3") || name.starts_with("pythoncore-3")) {
+            let is_pyenv_ver = root.to_string_lossy().to_ascii_lowercase().ends_with("pyenv-win\\versions")
+                && name.starts_with('3');
+            if !(name.starts_with("python3") || name.starts_with("pythoncore-3") || is_pyenv_ver) {
                 continue;
             }
             let executable = entry.path().join("python.exe");
@@ -176,14 +187,88 @@ fn installed_python_dirs() -> Vec<PathBuf> {
     found
 }
 
-fn system_python() -> Option<PathBuf> {
-    probe_python("py", Some("-3"))
-        .or_else(|| probe_python("python", None))
-        .or_else(|| probe_python("python3", None))
-        .or_else(|| probe_python("py", None))
-        .or_else(launcher_python)
-        .or_else(registry_python)
-        .or_else(|| installed_python_dirs().into_iter().next())
+/// Collect all unique, real Python executables available on this machine,
+/// putting `python` on PATH first so a machine that responds to `python` in
+/// the terminal is reused directly.
+fn system_pythons() -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut push = |path: PathBuf| {
+        if !path.is_file() || is_windows_store_stub(&path) {
+            return;
+        }
+        let key = path.to_string_lossy().to_ascii_lowercase();
+        if seen.insert(key) {
+            candidates.push(path);
+        }
+    };
+    for found in [
+        probe_python("python", None),
+        probe_python("py", Some("-3")),
+        probe_python("python3", None),
+        probe_python("py", None),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        push(found);
+    }
+    for found in where_pythons() {
+        push(found);
+    }
+    if let Ok(output) = silent_command("py").arg("-0p").output() {
+        if output.status.success() {
+            for found in launcher_paths(&String::from_utf8_lossy(&output.stdout)) {
+                push(found);
+            }
+        }
+    }
+    for hive in ["HKCU", "HKLM"] {
+        for key in [
+            "SOFTWARE\\Python\\PythonCore",
+            "SOFTWARE\\WOW6432Node\\Python\\PythonCore",
+        ] {
+            if let Ok(output) = silent_command("reg")
+                .args(["query", &format!("{hive}\\{key}"), "/s"])
+                .output()
+            {
+                if output.status.success() {
+                    for found in registry_paths(&String::from_utf8_lossy(&output.stdout)) {
+                        push(found);
+                    }
+                }
+            }
+        }
+    }
+    for found in installed_python_dirs() {
+        push(found);
+    }
+    candidates
+}
+
+/// Choose the best existing local Python on this machine: prefer one that
+/// already has all runtime dependencies installed; otherwise fall back to the
+/// first working Python 3 interpreter.
+pub(crate) fn best_local_python(root: &std::path::Path) -> Option<PathBuf> {
+    let code = code_root(&root.to_path_buf());
+    let candidates = system_pythons();
+    if candidates.is_empty() {
+        return None;
+    }
+    let mut first_valid: Option<PathBuf> = None;
+    for candidate in candidates.iter().take(6) {
+        if let Ok((major, minor, _)) = runtime::python_minor_version(candidate) {
+            if major == 3 && minor >= 10 {
+                if first_valid.is_none() {
+                    first_valid = Some(candidate.clone());
+                }
+                if runtime::missing_dependencies(candidate, &code, Duration::from_secs(6)).is_ok() {
+                    return Some(candidate.clone());
+                }
+            }
+        }
+    }
+    first_valid.or_else(|| candidates.into_iter().next())
 }
 
 /// Printed in the environment check so a detected interpreter is visible even
@@ -198,28 +283,38 @@ fn python_version(python: &PathBuf) -> Option<String> {
     })
 }
 
-/// A bundled runtime or project venv wins because it can carry camoufox;
-/// otherwise fall back to the machine-wide Python. The resolved interpreter is
-/// cached: without it every 3s `list` poll also re-probed `py -3`/`python`.
+static PYTHON_CACHE: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+pub(crate) fn reset_python_cache() {
+    if let Ok(mut guard) = PYTHON_CACHE.lock() {
+        *guard = None;
+    }
+}
+
+/// Prefer a user-selected / local-reused venv or bundled runtime; otherwise
+/// detect the best machine-wide Python. Cached between polls and cleared on
+/// explicit re-check or setup.
 fn python_path(root: &PathBuf) -> PathBuf {
-    if let Some(path) = runtime::selected_python(root).or_else(|| runtime::prepared_python(root)) {
+    if let Some(path) = runtime::selected_python(root)
+        .or_else(|| bundled_python(root))
+        .or_else(|| runtime::prepared_python(root))
+    {
         return path;
     }
-    static CACHE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    if let Some(path) = CACHE.get() {
-        // A cached interpreter can disappear (uninstalled or upgraded in
-        // another folder); re-detect instead of reporting a stale path.
-        if path.is_file() {
-            return path.clone();
+    if let Ok(guard) = PYTHON_CACHE.lock() {
+        if let Some(path) = guard.as_ref() {
+            if path.is_file() {
+                return path.clone();
+            }
         }
     }
-    let resolved = bundled_python(root)
-        .or_else(system_python)
-        .unwrap_or_else(|| PathBuf::from("python"));
+    let resolved = best_local_python(root).unwrap_or_else(|| PathBuf::from("python"));
     // Do not cache the bare fallback, so installing Python later is picked up
     // by the environment check without restarting the GUI.
     if resolved.is_file() {
-        let _ = CACHE.set(resolved.clone());
+        if let Ok(mut guard) = PYTHON_CACHE.lock() {
+            *guard = Some(resolved.clone());
+        }
     }
     resolved
 }
@@ -227,6 +322,53 @@ fn python_path(root: &PathBuf) -> PathBuf {
 fn cli_path(root: &PathBuf) -> PathBuf {
     let bundled = root.join("resources").join("core").join("cli.py");
     if bundled.is_file() { bundled } else { root.join("core").join("cli.py") }
+}
+
+/// Run a probe process with a hard timeout and capture stdout/stderr so
+/// callers can report exact errors without hanging the UI.
+pub(crate) fn run_output_with_timeout(
+    program: &std::path::Path,
+    args: &[&str],
+    cwd: &std::path::Path,
+    timeout: std::time::Duration,
+) -> Option<(bool, String, String)> {
+    let mut child = silent_command(program)
+        .args(args)
+        .current_dir(cwd)
+        .env("PYTHONIOENCODING", "utf-8")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let mut stdout_pipe = child.stdout.take()?;
+    let mut stderr_pipe = child.stderr.take()?;
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stdout_pipe.read_to_end(&mut buffer);
+        buffer
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = stderr_pipe.read_to_end(&mut buffer);
+        buffer
+    });
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let stdout = String::from_utf8_lossy(&stdout_reader.join().unwrap_or_default()).into_owned();
+    let stderr = String::from_utf8_lossy(&stderr_reader.join().unwrap_or_default()).into_owned();
+    Some((status.success(), stdout, stderr))
 }
 
 /// Run a probe process with a hard timeout so a hanging interpreter can never
@@ -237,28 +379,7 @@ fn run_with_timeout(
     cwd: &PathBuf,
     timeout: std::time::Duration,
 ) -> Option<bool> {
-    use std::process::Stdio;
-    let mut child = silent_command(program)
-        .args(args)
-        .current_dir(cwd)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let started = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Some(status.success()),
-            Ok(None) if started.elapsed() < timeout => {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
-    }
+    run_output_with_timeout(program, args, cwd, timeout).map(|(ok, _, _)| ok)
 }
 
 fn find_camoufox_exe(dir: &PathBuf, depth: usize) -> Option<PathBuf> {
@@ -469,6 +590,7 @@ async fn environment_check() -> Result<Value, String> {
 }
 
 fn environment_check_sync() -> Result<Value, String> {
+    reset_python_cache();
     let root = project_root();
     let data_root = storage_root(&root);
     let python = python_path(&root);
@@ -481,14 +603,12 @@ fn environment_check_sync() -> Result<Value, String> {
     let camoufox_exe = find_engine(&root);
     let engine_ok = camoufox_exe.is_some();
     // Probe the import with a timeout: a slow interpreter must not freeze the UI.
-    let camoufox_import_ok = python_ok
-        && run_with_timeout(
-            &python,
-            &["-c", "import camoufox, playwright, fpgen, PIL, socks"],
-            &code_root(&root),
-            std::time::Duration::from_secs(10),
-        )
-        .unwrap_or(false);
+    let missing_deps = if python_ok {
+        runtime::missing_dependencies(&python, &code_root(&root), std::time::Duration::from_secs(10)).err()
+    } else {
+        None
+    };
+    let camoufox_import_ok = python_ok && missing_deps.is_none();
     let checks = vec![
         serde_json::json!({
             "key": "python",
@@ -500,7 +620,7 @@ fn environment_check_sync() -> Result<Value, String> {
                     None => python.display().to_string(),
                 }
             } else {
-                "未检测到可用的 Python 解释器".to_string()
+                "未自动检测到本机 Python。如果本机已安装，请点「选择本地目录」指定 Python 路径；否则可按手动安装说明安装".to_string()
             }
         }),
         serde_json::json!({
@@ -510,9 +630,10 @@ fn environment_check_sync() -> Result<Value, String> {
             "detail": if camoufox_import_ok {
                 "该 Python 已安装 camoufox、playwright、fpgen、Pillow、PySocks".to_string()
             } else if python_ok {
-                "当前 Python 缺少运行依赖。点「使用独立运行时」将下载并切换到内置依赖的独立 Python；也可在设置中手动配置已有 Python".to_string()
+                let missing_hint = missing_deps.as_deref().map(|m| format!("（缺少：{m}）")).unwrap_or_default();
+                format!("已检测到本机 Python，但缺少运行依赖{missing_hint}。点「一键安装依赖」将复用此 Python 创建独立环境并安装依赖，无需下载完整 Python 包")
             } else {
-                "需要先安装或选择一个 Python 解释器".to_string()
+                "请先选择本机 Python 目录，或手动安装 Python".to_string()
             }
         }),
         serde_json::json!({
@@ -543,6 +664,9 @@ fn environment_check_sync() -> Result<Value, String> {
         "ready": python_ok && cli_ok && profiles_ok && engine_ok && camoufox_import_ok,
         "root": root.display().to_string(),
         "data_root": data_root.display().to_string(),
+        "python_detected": python_ok,
+        "python_path": python_ok.then(|| python.display().to_string()),
+        "python_version": detected_version,
         "dependencies_ready": camoufox_import_ok,
         "fonts_ready": fonts::overview(&root, &serde_json::json!({}))?["ready"],
         "python_size": manifest.as_ref().map(|m| m.python.size),
@@ -610,6 +734,27 @@ async fn select_python(path: String) -> Result<Value, String> {
             environment_check_sync()
         })
     }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn setup_local_python(path: Option<String>, proxy: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        runtime::operation(|| {
+            let root = project_root();
+            let executable = runtime::setup_local_python(&root, path.as_deref(), &proxy)?;
+            Ok(serde_json::json!({
+                "path": executable,
+                "environment": environment_check_sync()?,
+            }))
+        })
+    }).await.map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn pick_python_path(kind: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || runtime::pick_python_location(&kind))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -1160,6 +1305,8 @@ pub fn run() {
             cancel_runtime,
             install_runtime,
             select_python,
+            setup_local_python,
+            pick_python_path,
             create_identity,
             edit_identity,
             reorder_identities,
@@ -1236,5 +1383,15 @@ HKEY_CURRENT_USER\\SOFTWARE\\Python\\PythonCore\\3.13\\InstallPath
                 PathBuf::from("C:\\Python313\\python.exe"),
             ]
         );
+    }
+
+    #[test]
+    fn windows_store_stub_is_filtered() {
+        assert!(is_windows_store_stub(&PathBuf::from(
+            "C:\\Users\\alice\\AppData\\Local\\Microsoft\\WindowsApps\\python.exe"
+        )));
+        assert!(!is_windows_store_stub(&PathBuf::from(
+            "C:\\Users\\alice\\AppData\\Local\\Programs\\Python\\Python312\\python.exe"
+        )));
     }
 }

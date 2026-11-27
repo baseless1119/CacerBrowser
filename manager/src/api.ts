@@ -109,9 +109,18 @@ export async function cancelRuntime(): Promise<void> {
 export async function selectPython(path: string): Promise<EnvironmentCheck> {
   return invoke("select_python", { path });
 }
+export async function setupLocalPython(path?: string | null, proxy = ""): Promise<{ path: string; environment: EnvironmentCheck }> {
+  return invoke("setup_local_python", { path: path?.trim() || null, proxy });
+}
+export async function pickPythonPath(kind: "dir" | "file"): Promise<string | null> {
+  return invoke("pick_python_path", { kind });
+}
 
 export interface EnvironmentCheck {
   ready: boolean;
+  python_detected: boolean;
+  python_path: string | null;
+  python_version: string | null;
   dependencies_ready: boolean;
   fonts_ready: boolean;
   python_size: number | null;

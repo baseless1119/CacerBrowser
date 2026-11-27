@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState, type ButtonHTMLAttributes, type D
 import { getVersion } from "@tauri-apps/api/app";
 import {
   ClashConfig, CreateRequest, DataOverview, EditRequest, ExtensionItem, ExtensionSearchResult, HistoryItem, Identity, ProxyNode, ProxySource,
-  cancelRuntime, installRuntime, runtimeStatus, selectPython, type RuntimeStatus,
+  cancelRuntime, installRuntime, runtimeStatus, setupLocalPython, pickPythonPath, type RuntimeStatus,
   checkUpdate, downloadUpdate, updateStatus, cancelUpdate, installUpdate, type UpdateInfo, type UpdateStatus,
   saveDownloadSettings, fontOverview, type FontOverview,
   clashConfigs, cloneIdentity, createIdentity, dataOverview, deleteIdentity, editIdentity, environmentCheck,
@@ -88,22 +88,32 @@ function PendingButton({ busy, idle, pending, disabled, ...props }: Omit<ButtonH
   </button>;
 }
 
-/// One card per environment check: green checkmark when installed, an install
-/// button on the right when a missing piece can be fixed from here.
+type EnvCardAction = "local-python" | "pick-dir" | "manual" | "engine";
+
+/// One card per environment check: green checkmark when installed, actionable
+/// buttons on the right when a missing piece can be fixed from here.
 function EnvChecks(props: {
   checks: EnvironmentCheck["checks"];
-  onInstall?: (kind: "python" | "engine") => void;
+  pythonDetected?: boolean;
+  onAction?: (action: EnvCardAction) => void;
   busy?: boolean;
 }) {
   return <div className="env-checks">{props.checks.map((check) => {
-    const action = check.key === "python" || check.key === "dependencies" ? "python"
-      : check.key === "engine" ? "engine" : null;
-    const actionLabel = check.key === "python" ? "安装独立 Python" : check.key === "engine" ? "重新安装说明" : "使用独立运行时";
     return <div className={`env-card ${check.ok ? "ok" : "bad"}`} key={check.key}>
       <span className="env-mark">{check.ok ? "✓" : "!"}</span>
       <div className="env-copy"><strong>{check.label}</strong><p>{check.detail}</p></div>
-      {!check.ok && action && props.onInstall
-        && <button className="secondary env-action" disabled={props.busy} onClick={() => props.onInstall?.(action)}>{actionLabel}</button>}
+      {!check.ok && props.onAction && check.key === "dependencies" && props.pythonDetected && (
+        <button className="primary env-action env-action-primary" disabled={props.busy} onClick={() => props.onAction?.("local-python")}>一键安装依赖</button>
+      )}
+      {!check.ok && props.onAction && check.key === "python" && (
+        <div className="env-actions">
+          <button className="primary env-action env-action-primary" disabled={props.busy} onClick={() => props.onAction?.("pick-dir")}>选择本地目录</button>
+          <button className="secondary env-action" disabled={props.busy} onClick={() => props.onAction?.("manual")}>手动安装</button>
+        </div>
+      )}
+      {!check.ok && props.onAction && check.key === "engine" && (
+        <button className="secondary env-action" disabled={props.busy} onClick={() => props.onAction?.("engine")}>重新安装说明</button>
+      )}
     </div>;
   })}</div>;
 }
@@ -137,7 +147,7 @@ export default function App() {
   const [showProxy, setShowProxy] = useState(false);
   const [proxyStep, setProxyStep] = useState<"ask" | "input">("ask");
   const [proxyValue, setProxyValue] = useState("");
-  const [failedTask, setFailedTask] = useState<"python" | "fonts" | null>(null);
+  const [failedTask, setFailedTask] = useState<"python" | "local-python" | "fonts" | null>(null);
   const proxyRetry = useRef<((proxy: string) => void) | null>(null);
   const [fontPlan, setFontPlan] = useState<FontOverview | null>(null);
   const [fontCountry, setFontCountry] = useState("");
@@ -147,6 +157,7 @@ export default function App() {
   const fontRequest = useRef(0);
   const [pendingLaunch, setPendingLaunch] = useState<string | null>(null);
   const [pythonPath, setPythonPath] = useState("");
+  const [manualOpen, setManualOpen] = useState(false);
   const environmentRef = useRef<EnvironmentCheck | null>(null);
   const [copied, setCopied] = useState(false);
   const [proxySourceList, setProxySourceList] = useState<ProxySource[]>([]);
@@ -232,6 +243,7 @@ export default function App() {
       const result = await environmentCheck();
       environmentRef.current = result;
       setEnvironment(result);
+      if (!result.python_detected) setManualOpen(true);
       if (result.ready) { setError(null); await refresh(true); await loadExtensions(); }
       return result;
     } catch (e) { setEnvironment(null); environmentRef.current = null; setError(String(e)); return null; }
@@ -341,13 +353,55 @@ export default function App() {
       await launchIdentity(id); setPendingLaunch(null); setView("environments");
     }
   }
-  async function applyPython() {
-    if (runtimeBusyRef.current) return;
+  async function setupLocalRuntime(customPath?: string, proxyOverride?: string): Promise<boolean> {
+    if (runtimeBusyRef.current) return false;
     runtimeBusyRef.current = true;
     setRuntimeBusy(true);
-    try { await selectPython(pythonPath); await checkEnvironment(); }
-    catch (e) { setError(String(e)); }
-    finally { runtimeBusyRef.current = false; setRuntimeBusy(false); }
+    setError(null);
+    setDownloadState({ busy: true, message: "正在检查本机 Python…", downloaded: 0, total: 0 });
+    const timer = window.setInterval(() => runtimeStatus().then(setDownloadState).catch(() => {}), 400);
+    try {
+      await setupLocalPython(customPath, proxyOverride ?? "");
+      await checkEnvironment();
+      setNotice("已复用本机 Python 完成依赖配置，后续可直接运行");
+      return true;
+    } catch (e) {
+      const message = String(e);
+      if (message.includes("已取消")) {
+        setError(null);
+      } else if (!message.includes(DOWNLOAD_ROUTES_FAILED)) {
+        setError(message);
+      } else if (proxyOverride !== undefined) {
+        setCopied(false);
+        setFailedTask("local-python");
+      } else {
+        void offerProxy((retryProxy) => { void setupLocalRuntime(customPath, retryProxy); });
+      }
+      return false;
+    } finally {
+      window.clearInterval(timer);
+      runtimeBusyRef.current = false;
+      setRuntimeBusy(false);
+      setDownloadState(null);
+    }
+  }
+  async function browsePython(kind: "dir" | "file", autoSetup = false) {
+    if (runtimeBusyRef.current) return;
+    setError(null);
+    try {
+      const chosen = await pickPythonPath(kind);
+      if (!chosen) return;
+      setPythonPath(chosen);
+      if (autoSetup) {
+        await setupLocalRuntime(chosen);
+      }
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+  async function applyPython() {
+    if (!pythonPath.trim()) return;
+    await setupLocalRuntime(pythonPath);
   }
   async function launchPrepared(id: string) {
     if (!environmentRef.current?.ready) { setError("运行环境未就绪，请先安装 Python 依赖。"); return; }
@@ -362,12 +416,21 @@ export default function App() {
     await launchIdentity(id);
   }
   const guideText = environment?.manual_commands ?? "正在读取安装命令…";
-  function installFromCard(kind: "python" | "engine") {
-    if (kind === "engine") {
+  function handleEnvAction(action: EnvCardAction) {
+    if (action === "engine") {
       setError("浏览器引擎随安装包提供，若文件缺失请重新安装当前版本。");
       return;
     }
-    void setupRuntime("python");
+    if (action === "local-python") {
+      void setupLocalRuntime();
+      return;
+    }
+    if (action === "pick-dir") {
+      void browsePython("dir", true);
+      return;
+    }
+    setManualOpen(true);
+    openSettings();
   }
   async function copyGuide() {
     try {
@@ -773,21 +836,42 @@ export default function App() {
 
   const runtimeControls = <section className="edit-section">
     <h4>运行环境</h4>
-    <p className="hint">快捷安装会下载并切换到独立 Python（已包含运行依赖）；已有 Python 可在下方手动配置。字体按需下载，所有环境共享缓存。</p>
-    {environment && <EnvChecks checks={environment.checks} onInstall={installFromCard} busy={runtimeBusy} />}
-    <p className="hint">下载会依次尝试多个公开的 GitHub 镜像，再尝试系统代理；全部失败才会询问是否手动设置代理。镜像文件仍须通过内置 SHA256 校验。</p>
+    <p className="hint">优先复用本机已有 Python 并创建独立虚拟环境安装依赖，避免下载完整 Python 包；若未自动检测到，可手动选择 Python 目录或按指引安装。</p>
+    {environment && <EnvChecks checks={environment.checks} pythonDetected={environment.python_detected} onAction={handleEnvAction} busy={runtimeBusy} />}
+    <p className="hint">依赖安装会自动尝试国内 PyPI 镜像和系统代理；全部失败才会询问是否手动设置代理。</p>
     <div className="settings-actions">
-      <button className="primary" disabled={runtimeBusy} onClick={() => setupRuntime("python")}>快捷安装 Python 与依赖{environment?.python_size ? `（${formatSize(environment.python_size)}）` : ""}</button>
+      {environment?.python_detected
+        ? <>
+          {!environment.dependencies_ready && <button className="primary" disabled={runtimeBusy} onClick={() => setupLocalRuntime()}>一键安装依赖（复用本机 Python）</button>}
+          <button className="secondary" disabled={runtimeBusy} onClick={() => browsePython("dir", true)}>选择其他 Python 目录</button>
+        </>
+        : <>
+          <button className="primary" disabled={runtimeBusy} onClick={() => browsePython("dir", true)}>选择本地 Python 目录</button>
+          <button className="secondary" disabled={runtimeBusy} onClick={() => browsePython("file", true)}>选择 python.exe</button>
+        </>}
       <button className="secondary" onClick={() => { setShowSettings(false); setView("fonts"); }}>管理字体库</button>
       <button className="secondary" disabled={runtimeBusy} onClick={checkEnvironment}>重新检查</button>
       <button className="secondary" disabled={runtimeBusy || !!updateState?.busy} onClick={clearDownloadProxy}>清除下载代理，恢复自动检测</button>
     </div>
-    <details><summary>手动安装 Python / 使用已有 Python</summary>
-      <p className="hint">将以下命令复制到 PowerShell 执行。已有 Python 时可以跳过安装步骤，再填入已安装依赖的解释器路径。</p>
+    <details open={manualOpen} onToggle={(e) => setManualOpen(e.currentTarget.open)}><summary>手动安装 Python / 指定本地目录</summary>
+      <p className="hint">可手动选择或粘贴本机 Python 安装目录（或 python.exe 路径）。若已有依赖会直接启用；若缺少依赖，点击下方按钮会自动基于该 Python 创建独立环境并安装依赖。</p>
+      <label className="edit-field">
+        <span>Python 安装目录或 python.exe 路径</span>
+        <div className="path-picker-row">
+          <input value={pythonPath} onChange={(e) => setPythonPath(e.target.value)} placeholder="例如：C:\\Python312 或 C:\\…\\python.exe" disabled={runtimeBusy} />
+          <button type="button" className="secondary" disabled={runtimeBusy} onClick={() => browsePython("dir", false)}>选择目录</button>
+          <button type="button" className="secondary" disabled={runtimeBusy} onClick={() => browsePython("file", false)}>选择文件</button>
+        </div>
+      </label>
+      <div className="settings-actions">
+        <button className="primary" onClick={applyPython} disabled={runtimeBusy || !pythonPath.trim()}>使用此 Python（缺依赖时自动安装）</button>
+      </div>
+      <p className="hint">如果机器尚未安装 Python，可将以下命令复制到 PowerShell 执行安装：</p>
       <pre className="cmd-block">{guideText}</pre>
-      <button className="secondary" onClick={copyGuide}>{copied ? "已复制" : "复制安装命令"}</button>
-      <label className="edit-field"><span>Python 解释器路径</span><input value={pythonPath} onChange={(e) => setPythonPath(e.target.value)} placeholder="C:\\…\\Scripts\\python.exe" disabled={runtimeBusy} /></label>
-      <button className="secondary" onClick={applyPython} disabled={runtimeBusy || !pythonPath.trim()}>检查并使用此 Python</button>
+      <div className="settings-actions">
+        <button className="secondary" onClick={copyGuide}>{copied ? "已复制" : "复制安装命令"}</button>
+        <button className="secondary" disabled={runtimeBusy} onClick={() => setupRuntime("python")}>备用：下载独立运行时{environment?.python_size ? `（${formatSize(environment.python_size)}）` : ""}</button>
+      </div>
     </details>
   </section>;
 
@@ -803,7 +887,7 @@ export default function App() {
     <section className="workspace">
       <header className="topbar"><div className="breadcrumb"><span>工作台</span><b>/</b><strong>{VIEW_LABEL[view]}</strong></div><div className="top-actions">{update?.available && <button className="icon-button update-button" title={`发现新版本 ${update.latest}`} onClick={() => setShowUpdate(true)}>⤓<i className="update-dot" /></button>}<button className="icon-button" title="刷新" onClick={() => refresh(true)}>↻</button><button className="icon-button" title="设置" onClick={openSettings}>⚙</button></div></header>
       <div className="content">
-        {environment && !environment.ready && <div className="banner warning env-banner"><div className="env-banner-body"><div className="env-banner-head"><strong>运行环境未就绪</strong><button className="env-recheck" onClick={checkEnvironment} disabled={runtimeBusy}>重新检查</button></div><EnvChecks checks={environment.checks} onInstall={installFromCard} busy={runtimeBusy} /></div></div>}
+        {environment && !environment.ready && <div className="banner warning env-banner"><div className="env-banner-body"><div className="env-banner-head"><strong>运行环境未就绪</strong><button className="env-recheck" onClick={checkEnvironment} disabled={runtimeBusy}>重新检查</button></div><EnvChecks checks={environment.checks} pythonDetected={environment.python_detected} onAction={handleEnvAction} busy={runtimeBusy} /></div></div>}
         {error && <div className="banner error"><span>!</span><span>{error}</span><button onClick={() => setError(null)}>×</button></div>}
         {notice && <div className="banner success"><span>✓</span><span>{notice}</span></div>}
         {view === "fonts" && <>
@@ -980,15 +1064,19 @@ export default function App() {
         </>}
       <div className="modal-footer"><button className="secondary" onClick={() => setShowClash(false)} disabled={!!subBusy}>关闭</button><button className="primary" onClick={importAllClash} disabled={!!subBusy || localClashConfigs.length === 0}>全部导入</button></div>
     </Modal>}
-    {failedTask && <Modal title="下载失败" onClose={() => setFailedTask(null)}>
+    {failedTask && <Modal title="安装失败" onClose={() => setFailedTask(null)}>
       <section className="edit-section">
-        {failedTask === "python" ? <>
+        {failedTask === "local-python" ? <>
+          <p className="hint">重试后仍无法通过 pip 安装依赖。可在 PowerShell 中手动执行以下命令安装，或改用内置依赖的独立运行时。</p>
+          <pre className="cmd-block">{guideText}</pre>
+        </> : failedTask === "python" ? <>
           <p className="hint">重试后仍无法下载运行环境。可在 PowerShell 中手动执行以下命令安装，完成后回到主界面点「重新检查」。</p>
           <pre className="cmd-block">{guideText}</pre>
         </> : <p className="hint">字体下载失败，请检查网络后在「字体库」页面重新尝试。</p>}
       </section>
       <div className="modal-footer">
-        {failedTask === "python" && <button className="secondary" onClick={copyGuide}>{copied ? "已复制" : "复制安装命令"}</button>}
+        {(failedTask === "python" || failedTask === "local-python") && <button className="secondary" onClick={copyGuide}>{copied ? "已复制" : "复制安装命令"}</button>}
+        {failedTask === "local-python" && <button className="secondary" onClick={() => { setFailedTask(null); void setupRuntime("python"); }}>改用独立运行时（备用）</button>}
         <button className="secondary" onClick={() => setFailedTask(null)}>关闭</button>
       </div>
     </Modal>}

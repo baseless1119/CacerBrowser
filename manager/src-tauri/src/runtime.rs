@@ -127,14 +127,387 @@ pub fn selected_python(root: &Path) -> Option<PathBuf> {
     let path = PathBuf::from(fs::read_to_string(cache(root).join("python-path.txt")).ok()?.trim());
     path.is_file().then_some(path)
 }
-pub fn select_python(root: &Path, path: &str) -> Result<(), String> {
-    let executable = PathBuf::from(path.trim().trim_matches('"'));
-    if !executable.is_file() { return Err("请选择现有的 python.exe 文件".into()); }
-    if !super::run_with_timeout(&executable, &["-c", "import camoufox, playwright, fpgen, PIL, socks"], &super::code_root(&root.to_path_buf()), Duration::from_secs(20)).unwrap_or(false) {
-        return Err("该 Python 缺少运行依赖，请先执行安装命令".into());
-    }
+pub fn save_selected_python(root: &Path, executable: &Path) -> Result<(), String> {
     fs::create_dir_all(cache(root)).map_err(|e| e.to_string())?;
-    fs::write(cache(root).join("python-path.txt"), executable.to_string_lossy().as_bytes()).map_err(|e| e.to_string())
+    fs::write(cache(root).join("python-path.txt"), executable.to_string_lossy().as_bytes())
+        .map_err(|e| e.to_string())?;
+    super::reset_python_cache();
+    Ok(())
+}
+/// Accept either a `python.exe` file path or a Python installation / venv directory.
+pub fn resolve_python_input(input: &str) -> Result<PathBuf, String> {
+    let trimmed = input.trim().trim_matches('"');
+    if trimmed.is_empty() {
+        return Err("请选择 Python 目录或 python.exe 文件".into());
+    }
+    let path = PathBuf::from(trimmed);
+    if path.is_file() {
+        return Ok(path);
+    }
+    if path.is_dir() {
+        let candidates = [
+            path.join("python.exe"),
+            path.join("Scripts").join("python.exe"),
+            path.join(".venv").join("Scripts").join("python.exe"),
+            path.join("venv").join("Scripts").join("python.exe"),
+            path.join("bin").join("python.exe"),
+        ];
+        if let Some(found) = candidates.into_iter().find(|candidate| candidate.is_file()) {
+            return Ok(found);
+        }
+        return Err("该目录中未找到 python.exe，请选择 Python 安装目录或 python.exe 文件".into());
+    }
+    Err("路径不存在，请选择有效的 Python 目录或 python.exe 文件".into())
+}
+const DEP_CHECK_SCRIPT: &str = r#"import importlib
+missing = []
+for mod in ("camoufox", "playwright", "fpgen", "PIL", "socks"):
+    try:
+        importlib.import_module(mod)
+    except Exception:
+        missing.append(mod)
+if missing:
+    print(", ".join(missing))
+    raise SystemExit(1)
+"#;
+/// Verify that all required runtime modules can be imported. Returns `Err(missing)`
+/// listing the missing module names or failure reason.
+pub fn missing_dependencies(python: &Path, cwd: &Path, timeout: Duration) -> Result<(), String> {
+    match super::run_output_with_timeout(python, &["-c", DEP_CHECK_SCRIPT], cwd, timeout) {
+        Some((true, _, _)) => Ok(()),
+        Some((false, stdout, stderr)) => {
+            let detail = stdout.trim();
+            if !detail.is_empty() {
+                Err(detail.to_string())
+            } else {
+                let err = stderr.lines().rev().find(|line| !line.trim().is_empty()).unwrap_or("依赖检查失败");
+                Err(err.trim().to_string())
+            }
+        }
+        None => Err("依赖检查超时".into()),
+    }
+}
+pub fn python_minor_version(python: &Path) -> Result<(u32, u32, String), String> {
+    let script = "import sys; print(f'{sys.version_info[0]}.{sys.version_info[1]}|{sys.version.split()[0]}')";
+    let cwd = python.parent().unwrap_or_else(|| Path::new("."));
+    let Some((true, stdout, _)) = super::run_output_with_timeout(python, &["-c", script], cwd, Duration::from_secs(10)) else {
+        return Err("无法执行该 Python 解释器，请确认选择了有效的 python.exe".into());
+    };
+    let line = stdout.trim();
+    let Some((mm, full)) = line.split_once('|') else {
+        return Err("无法识别该 Python 版本".into());
+    };
+    let mut parts = mm.split('.');
+    let major = parts.next().and_then(|v| v.parse::<u32>().ok()).ok_or("无法解析 Python 主版本号")?;
+    let minor = parts.next().and_then(|v| v.parse::<u32>().ok()).ok_or("无法解析 Python 次版本号")?;
+    Ok((major, minor, full.to_string()))
+}
+pub fn select_python(root: &Path, path: &str) -> Result<PathBuf, String> {
+    let executable = resolve_python_input(path)?;
+    if let Err(missing) = missing_dependencies(&executable, &super::code_root(&root.to_path_buf()), Duration::from_secs(20)) {
+        return Err(format!("该 Python 缺少运行依赖（{missing}），请点「一键安装依赖」复用此 Python 自动配置"));
+    }
+    save_selected_python(root, &executable)?;
+    Ok(executable)
+}
+const DIRECT_RUNTIME_PACKAGES: [&str; 6] = [
+    "camoufox[geoip]",
+    "playwright",
+    "fpgen",
+    "Pillow",
+    "PySocks",
+    "PyYAML",
+];
+const PYPI_MIRRORS: [(&str, &str, &str); 2] = [
+    ("https://pypi.tuna.tsinghua.edu.cn/simple", "pypi.tuna.tsinghua.edu.cn", "清华镜像"),
+    ("https://mirrors.aliyun.com/pypi/simple/", "mirrors.aliyun.com", "阿里云镜像"),
+];
+fn run_cancellable_command(
+    program: &Path,
+    args: &[String],
+    cwd: &Path,
+    timeout: Duration,
+    label: &str,
+) -> Result<(), String> {
+    use std::io::{BufRead, BufReader};
+    use std::process::Stdio;
+    cancelled()?;
+    let mut child = super::silent_command(program)
+        .args(args)
+        .current_dir(cwd)
+        .env("PYTHONIOENCODING", "utf-8")
+        .env("PIP_DISABLE_PIP_VERSION_CHECK", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("无法启动进程：{e}"))?;
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+    let label_owned = label.to_string();
+    let stdout_thread = std::thread::spawn(move || {
+        let mut last = String::new();
+        if let Some(pipe) = stdout_pipe {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                let text = line.trim();
+                if text.is_empty() { continue; }
+                last = text.to_string();
+                if text.starts_with("Collecting ")
+                    || text.starts_with("Downloading ")
+                    || text.starts_with("Installing collected")
+                    || text.starts_with("Using cached ")
+                {
+                    let summary: String = text.chars().take(64).collect();
+                    progress(&format!("{label_owned} · {summary}"), 0, 0);
+                }
+            }
+        }
+        last
+    });
+    let stderr_thread = std::thread::spawn(move || {
+        let mut lines = Vec::new();
+        if let Some(pipe) = stderr_pipe {
+            for line in BufReader::new(pipe).lines().map_while(Result::ok) {
+                let text = line.trim();
+                if !text.is_empty() {
+                    lines.push(text.to_string());
+                    if lines.len() > 20 { lines.remove(0); }
+                }
+            }
+        }
+        lines.join("\n")
+    });
+    let started = std::time::Instant::now();
+    let status = loop {
+        if CANCEL.load(Ordering::Relaxed) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err("已取消，可重新尝试".into());
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(Duration::from_millis(150));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("执行超时，请检查网络连接".into());
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("等待进程失败：{e}"));
+            }
+        }
+    };
+    let last_stdout = stdout_thread.join().unwrap_or_default();
+    let stderr_text = stderr_thread.join().unwrap_or_default();
+    if status.success() {
+        Ok(())
+    } else {
+        let detail = stderr_text
+            .lines()
+            .rev()
+            .find(|line| !line.trim().is_empty())
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(last_stdout);
+        Err(if detail.is_empty() { format!("退出码 {}", status.code().unwrap_or(-1)) } else { detail })
+    }
+}
+fn is_resolution_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("no matching distribution")
+        || lower.contains("could not find a version")
+        || lower.contains("requires-python")
+        || lower.contains("ignored the following versions")
+}
+/// Reuse an existing local Python: if it already has all dependencies, select it directly;
+/// otherwise create an isolated venv under `runtime-cache` from that Python and install
+/// dependencies via pip (avoiding downloading the full standalone Python archive).
+pub fn setup_local_python(root: &Path, input_path: Option<&str>, proxy: &str) -> Result<PathBuf, String> {
+    let base_python = match input_path.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(text) => resolve_python_input(text)?,
+        None => super::best_local_python(root)
+            .ok_or("未自动检测到本机 Python，请先选择本地 Python 目录或手动安装")?,
+    };
+    let code = super::code_root(&root.to_path_buf());
+    progress("正在检查本机 Python 版本…", 0, 0);
+    let (major, minor, full_version) = python_minor_version(&base_python)?;
+    if major != 3 || minor < 10 {
+        return Err(format!("该 Python 版本过低（{full_version}），需要 Python 3.10 及以上版本"));
+    }
+    progress(&format!("正在检查 Python {full_version} 已有依赖…"), 0, 0);
+    if missing_dependencies(&base_python, &code, Duration::from_secs(20)).is_ok() {
+        save_selected_python(root, &base_python)?;
+        return Ok(base_python);
+    }
+    let venv_key = format!(
+        "{:x}",
+        Sha256::digest(format!("{}|{}", base_python.to_string_lossy().to_ascii_lowercase(), full_version).as_bytes())
+    );
+    let venv_id = &venv_key[..16];
+    let venv_dir = cache(root).join(format!("local-venv-{venv_id}"));
+    let venv_python = venv_dir.join("Scripts").join("python.exe");
+    if complete(&venv_dir, &venv_key)
+        && venv_python.is_file()
+        && missing_dependencies(&venv_python, &code, Duration::from_secs(20)).is_ok()
+    {
+        save_selected_python(root, &venv_python)?;
+        return Ok(venv_python);
+    }
+    cancelled()?;
+    progress(&format!("正在基于本机 Python {full_version} 创建独立环境…"), 0, 0);
+    fs::create_dir_all(cache(root)).map_err(|e| e.to_string())?;
+    if venv_dir.exists() {
+        let _ = fs::remove_dir_all(&venv_dir);
+    }
+    let venv_result = (|| -> Result<PathBuf, String> {
+        run_cancellable_command(
+            &base_python,
+            &["-m".into(), "venv".into(), venv_dir.to_string_lossy().into_owned()],
+            &code,
+            Duration::from_secs(120),
+            "正在创建虚拟环境",
+        ).map_err(|e| format!("基于本机 Python 创建独立环境失败：{e}"))?;
+        if !venv_python.is_file() {
+            return Err("虚拟环境创建不完整（未找到 Scripts\\python.exe）".into());
+        }
+        if !super::run_with_timeout(&venv_python, &["-m", "pip", "--version"], &venv_dir, Duration::from_secs(20)).unwrap_or(false) {
+            progress("正在初始化 pip…", 0, 0);
+            run_cancellable_command(
+                &venv_python,
+                &["-m".into(), "ensurepip".into(), "--upgrade".into()],
+                &venv_dir,
+                Duration::from_secs(120),
+                "正在初始化 pip",
+            ).map_err(|e| format!("初始化 pip 失败：{e}"))?;
+        }
+        let settings = download_settings(root);
+        let explicit_proxy = if proxy.trim().is_empty() { settings.proxy } else { proxy.to_string() };
+        let system = super::system_proxy().ok()
+            .filter(|sys| sys["enabled"].as_bool() == Some(true))
+            .and_then(|sys| sys["server"].as_str().and_then(windows_proxy));
+        let mut routes: Vec<(Option<&str>, Option<&str>, String, String)> = Vec::new();
+        if !explicit_proxy.trim().is_empty() {
+            routes.push((None, None, explicit_proxy.trim().to_string(), "指定代理".into()));
+        }
+        for (url, host, label) in PYPI_MIRRORS {
+            routes.push((Some(url), Some(host), String::new(), label.into()));
+        }
+        if let Some(sys_proxy) = system {
+            routes.push((None, None, sys_proxy, "系统代理".into()));
+        }
+        routes.push((None, None, String::new(), "官方源".into()));
+
+        let requirements_file = resource_dir(root).join("requirements.txt");
+        let use_locked = requirements_file.is_file()
+            && manifest(root).ok().is_some_and(|m| m.python_version == format!("{major}.{minor}"));
+        let mut plans: Vec<Vec<String>> = Vec::new();
+        if use_locked {
+            plans.push(vec!["-r".into(), requirements_file.to_string_lossy().into_owned()]);
+        }
+        plans.push(DIRECT_RUNTIME_PACKAGES.iter().map(|s| (*s).to_string()).collect());
+
+        let mut installed = false;
+        let mut last_error = String::new();
+        'plans: for plan in plans {
+            for (index_url, trusted_host, route_proxy, route_label) in &routes {
+                cancelled()?;
+                let label = format!("正在安装依赖 · {route_label}");
+                progress(&label, 0, 0);
+                let mut args: Vec<String> = vec![
+                    "-m".into(),
+                    "pip".into(),
+                    "install".into(),
+                    "--prefer-binary".into(),
+                    "--default-timeout".into(),
+                    "30".into(),
+                    "--retries".into(),
+                    "2".into(),
+                ];
+                if let Some(url) = index_url {
+                    args.push("-i".into());
+                    args.push((*url).into());
+                }
+                if let Some(host) = trusted_host {
+                    args.push("--trusted-host".into());
+                    args.push((*host).into());
+                }
+                if !route_proxy.is_empty() {
+                    args.push("--proxy".into());
+                    args.push(route_proxy.clone());
+                }
+                args.extend(plan.iter().cloned());
+                match run_cancellable_command(&venv_python, &args, &venv_dir, Duration::from_secs(600), &label) {
+                    Ok(()) => {
+                        installed = true;
+                        break 'plans;
+                    }
+                    Err(error) => {
+                        cancelled()?;
+                        last_error = format!("{route_label}：{error}");
+                        if plan.first().map(String::as_str) == Some("-r") && is_resolution_error(&error) {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if !installed {
+            return Err(format!("所有下载线路均失败，无法通过 pip 安装依赖。{last_error}"));
+        }
+        progress("正在验证依赖…", 0, 0);
+        if let Err(missing) = missing_dependencies(&venv_python, &code, Duration::from_secs(30)) {
+            return Err(format!("依赖安装后验证失败（缺少：{missing}）"));
+        }
+        cancelled()?;
+        fs::write(venv_dir.join(".complete"), &venv_key).map_err(|e| e.to_string())?;
+        save_selected_python(root, &venv_python)?;
+        Ok(venv_python)
+    })();
+    if venv_result.is_err() {
+        let _ = fs::remove_dir_all(&venv_dir);
+    }
+    venv_result
+}
+/// Open a native Windows folder or file dialog without adding extra crate dependencies.
+pub fn pick_python_location(kind: &str) -> Result<Option<String>, String> {
+    let script = match kind {
+        "dir" => r#"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
+$dialog.Description = '选择本机 Python 安装目录（包含 python.exe 或 Scripts\python.exe）'
+$dialog.ShowNewFolderButton = $false
+if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
+    [Console]::Write($dialog.SelectedPath)
+}
+$owner.Dispose()"#,
+        "file" => r#"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$dialog = New-Object System.Windows.Forms.OpenFileDialog
+$dialog.Title = '选择 python.exe'
+$dialog.Filter = 'Python 解释器 (python.exe)|python.exe|可执行文件 (*.exe)|*.exe'
+if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
+    [Console]::Write($dialog.FileName)
+}
+$owner.Dispose()"#,
+        _ => return Err("未知选择类型".into()),
+    };
+    let output = super::silent_command("powershell.exe")
+        .args(["-NoProfile", "-STA", "-Command", script])
+        .output()
+        .map_err(|e| format!("无法打开系统选择窗口：{e}"))?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(if err.is_empty() { "打开系统选择窗口失败".into() } else { err });
+    }
+    let chosen = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!chosen.is_empty()).then_some(chosen))
 }
 fn digest_file(path: &Path) -> Result<String, String> {
     let mut file = File::open(path).map_err(|e| e.to_string())?;
@@ -355,15 +728,21 @@ pub fn install(root: &Path, kind: &str, proxy: &str) -> Result<PathBuf, String> 
 }
 fn ps_quote(text: &str) -> String { format!("'{}'", text.replace('\'', "''")) }
 pub fn guide(root: &Path) -> Result<String, String> {
-    let manifest = manifest(root)?;
-    let destination = cache(root).join(format!("manual-python-{}", &manifest.python.sha256[..16]));
+    let manifest = manifest(root).ok();
+    let version = manifest.as_ref().map(|m| m.python_version.as_str()).unwrap_or("3.12");
+    let suffix = manifest.as_ref().map(|m| &m.python.sha256[..16]).unwrap_or("local");
+    let destination = cache(root).join(format!("manual-python-{suffix}"));
     let requirements = resource_dir(root).join("requirements.txt");
+    let install_cmd = if requirements.is_file() {
+        format!("& {} -m pip install -r {}", ps_quote(&destination.join("Scripts/python.exe").to_string_lossy()), ps_quote(&requirements.to_string_lossy()))
+    } else {
+        format!("& {} -m pip install camoufox[geoip] playwright fpgen Pillow PySocks PyYAML", ps_quote(&destination.join("Scripts/python.exe").to_string_lossy()))
+    };
     Ok(format!(
-        "# 若未安装 Python，请先执行（或从 python.org 安装 Python {} x64）\nwinget install -e --id Python.Python.{}\n\n# 在 PowerShell 中执行，创建独立环境并安装依赖\npy -{} -m venv {}\n& {} -m pip install -r {}\n\n# 安装完成后，在下方填入此解释器路径并应用\n# {}",
-        manifest.python_version, manifest.python_version, manifest.python_version,
+        "# 若未安装 Python，请先执行（或从 python.org 安装 Python {} x64）\nwinget install -e --id Python.Python.{}\n\n# 已有 Python 时，可直接在下方选择其目录一键安装依赖，或在 PowerShell 手动执行：\npython -m venv {}\n{}\n\n# 安装完成后，选择或填入此解释器路径\n# {}",
+        version, version,
         ps_quote(&destination.to_string_lossy()),
-        ps_quote(&destination.join("Scripts/python.exe").to_string_lossy()),
-        ps_quote(&requirements.to_string_lossy()),
+        install_cmd,
         destination.join("Scripts/python.exe").display()
     ))
 }
@@ -506,5 +885,35 @@ mod tests {
     #[test]
     fn manual_commands_quote_paths() {
         assert_eq!(ps_quote("C:/it's a folder"), "'C:/it''s a folder'");
+    }
+    #[test]
+    fn resolve_python_input_accepts_files_and_directories() {
+        let dir = TestDir::new();
+        let root_py = dir.0.join("install").join("python.exe");
+        fs::create_dir_all(root_py.parent().unwrap()).unwrap();
+        fs::write(&root_py, b"").unwrap();
+        assert_eq!(resolve_python_input(&format!("\"{}\"", root_py.display())).unwrap(), root_py);
+        assert_eq!(resolve_python_input(&root_py.parent().unwrap().to_string_lossy()).unwrap(), root_py);
+
+        let venv_py = dir.0.join("myvenv").join("Scripts").join("python.exe");
+        fs::create_dir_all(venv_py.parent().unwrap()).unwrap();
+        fs::write(&venv_py, b"").unwrap();
+        assert_eq!(resolve_python_input(&dir.0.join("myvenv").to_string_lossy()).unwrap(), venv_py);
+
+        let dot_venv_py = dir.0.join("project").join(".venv").join("Scripts").join("python.exe");
+        fs::create_dir_all(dot_venv_py.parent().unwrap()).unwrap();
+        fs::write(&dot_venv_py, b"").unwrap();
+        assert_eq!(resolve_python_input(&dir.0.join("project").to_string_lossy()).unwrap(), dot_venv_py);
+
+        let empty_dir = dir.0.join("empty");
+        fs::create_dir_all(&empty_dir).unwrap();
+        assert!(resolve_python_input(&empty_dir.to_string_lossy()).is_err());
+        assert!(resolve_python_input(&dir.0.join("missing").to_string_lossy()).is_err());
+    }
+    #[test]
+    fn resolution_error_detection_matches_pip_messages() {
+        assert!(is_resolution_error("ERROR: No matching distribution found for numpy==2.5.4"));
+        assert!(is_resolution_error("ERROR: Package 'foo' requires a different Python: 3.11.0 not in '>=3.12' (Requires-Python)"));
+        assert!(!is_resolution_error("ReadTimeoutError: HTTPSConnectionPool(host='pypi.org', port=443): Read timed out."));
     }
 }
