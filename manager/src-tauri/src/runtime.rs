@@ -471,35 +471,75 @@ pub fn setup_local_python(root: &Path, input_path: Option<&str>, proxy: &str) ->
     }
     venv_result
 }
-/// Open a native Windows folder or file dialog without adding extra crate dependencies.
-pub fn pick_python_location(kind: &str) -> Result<Option<String>, String> {
+/// Open a native Windows folder, open-file, or save-file dialog without extra crate dependencies.
+/// All user-facing strings are passed via environment variables to avoid PowerShell quoting issues.
+pub fn pick_dialog(
+    kind: &str,
+    title: Option<&str>,
+    filter: Option<&str>,
+    default_name: Option<&str>,
+    default_dir: Option<&str>,
+) -> Result<Option<String>, String> {
     let script = match kind {
-        "dir" => r#"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        "dir" | "open_dir" => r#"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Windows.Forms
 $owner = New-Object System.Windows.Forms.Form
 $owner.TopMost = $true
 $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-$dialog.Description = '选择本机 Python 安装目录（包含 python.exe 或 Scripts\python.exe）'
+$dialog.Description = if ($env:CACER_DLG_TITLE) { $env:CACER_DLG_TITLE } else { '选择文件夹' }
 $dialog.ShowNewFolderButton = $false
+if ($env:CACER_DLG_DIR -and (Test-Path -LiteralPath $env:CACER_DLG_DIR)) {
+    $dialog.SelectedPath = $env:CACER_DLG_DIR
+}
 if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
     [Console]::Write($dialog.SelectedPath)
 }
 $owner.Dispose()"#,
-        "file" => r#"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+        "file" | "open_file" => r#"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Windows.Forms
 $owner = New-Object System.Windows.Forms.Form
 $owner.TopMost = $true
 $dialog = New-Object System.Windows.Forms.OpenFileDialog
-$dialog.Title = '选择 python.exe'
-$dialog.Filter = 'Python 解释器 (python.exe)|python.exe|可执行文件 (*.exe)|*.exe'
+$dialog.Title = if ($env:CACER_DLG_TITLE) { $env:CACER_DLG_TITLE } else { '选择文件' }
+$dialog.Filter = if ($env:CACER_DLG_FILTER) { $env:CACER_DLG_FILTER } else { '所有文件 (*.*)|*.*' }
+if ($env:CACER_DLG_DIR -and (Test-Path -LiteralPath $env:CACER_DLG_DIR)) {
+    $dialog.InitialDirectory = $env:CACER_DLG_DIR
+}
+if ($env:CACER_DLG_NAME) {
+    $dialog.FileName = $env:CACER_DLG_NAME
+}
+if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
+    [Console]::Write($dialog.FileName)
+}
+$owner.Dispose()"#,
+        "save_file" => r#"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+Add-Type -AssemblyName System.Windows.Forms
+$owner = New-Object System.Windows.Forms.Form
+$owner.TopMost = $true
+$dialog = New-Object System.Windows.Forms.SaveFileDialog
+$dialog.Title = if ($env:CACER_DLG_TITLE) { $env:CACER_DLG_TITLE } else { '保存文件' }
+$dialog.Filter = if ($env:CACER_DLG_FILTER) { $env:CACER_DLG_FILTER } else { '所有文件 (*.*)|*.*' }
+$dialog.AddExtension = $true
+$dialog.OverwritePrompt = $true
+if ($env:CACER_DLG_DIR -and (Test-Path -LiteralPath $env:CACER_DLG_DIR)) {
+    $dialog.InitialDirectory = $env:CACER_DLG_DIR
+}
+if ($env:CACER_DLG_NAME) {
+    $dialog.FileName = $env:CACER_DLG_NAME
+}
 if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
     [Console]::Write($dialog.FileName)
 }
 $owner.Dispose()"#,
         _ => return Err("未知选择类型".into()),
     };
-    let output = super::silent_command("powershell.exe")
-        .args(["-NoProfile", "-STA", "-Command", script])
+    let mut cmd = super::silent_command("powershell.exe");
+    cmd.args(["-NoProfile", "-STA", "-Command", script])
+        .env("CACER_DLG_TITLE", title.unwrap_or(""))
+        .env("CACER_DLG_FILTER", filter.unwrap_or(""))
+        .env("CACER_DLG_NAME", default_name.unwrap_or(""))
+        .env("CACER_DLG_DIR", default_dir.unwrap_or(""));
+    let output = cmd
         .output()
         .map_err(|e| format!("无法打开系统选择窗口：{e}"))?;
     if !output.status.success() {
@@ -508,6 +548,25 @@ $owner.Dispose()"#,
     }
     let chosen = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok((!chosen.is_empty()).then_some(chosen))
+}
+pub fn pick_python_location(kind: &str) -> Result<Option<String>, String> {
+    match kind {
+        "dir" => pick_dialog(
+            "open_dir",
+            Some("选择本机 Python 安装目录（包含 python.exe 或 Scripts\\python.exe）"),
+            None,
+            None,
+            None,
+        ),
+        "file" => pick_dialog(
+            "open_file",
+            Some("选择 python.exe"),
+            Some("Python 解释器 (python.exe)|python.exe|可执行文件 (*.exe)|*.exe"),
+            None,
+            None,
+        ),
+        _ => Err("未知选择类型".into()),
+    }
 }
 fn digest_file(path: &Path) -> Result<String, String> {
     let mut file = File::open(path).map_err(|e| e.to_string())?;

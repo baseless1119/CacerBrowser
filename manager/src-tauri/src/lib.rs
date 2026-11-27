@@ -757,6 +757,70 @@ async fn pick_python_path(kind: String) -> Result<Option<String>, String> {
         .map_err(|e| e.to_string())?
 }
 
+fn default_dialog_dir(preset: Option<&str>) -> Option<String> {
+    match preset {
+        Some("downloads") => std::env::var("USERPROFILE")
+            .ok()
+            .map(|home| PathBuf::from(home).join("Downloads"))
+            .filter(|dir| dir.is_dir())
+            .map(|dir| dir.to_string_lossy().into_owned()),
+        Some("packs") => Some(packs_dir(&project_root()).to_string_lossy().into_owned()),
+        Some("data") => Some(storage_root(&project_root()).to_string_lossy().into_owned()),
+        Some(other) if !other.trim().is_empty() => Some(other.trim().to_string()),
+        _ => None,
+    }
+}
+
+#[tauri::command]
+async fn pick_dialog(
+    kind: String,
+    title: Option<String>,
+    filter: Option<String>,
+    default_name: Option<String>,
+    default_dir: Option<String>,
+) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let resolved_dir = default_dialog_dir(default_dir.as_deref());
+        runtime::pick_dialog(
+            &kind,
+            title.as_deref(),
+            filter.as_deref(),
+            default_name.as_deref(),
+            resolved_dir.as_deref(),
+        )
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn reveal_path(path: String) -> Result<(), String> {
+    let trimmed = path.trim().trim_matches('"');
+    if trimmed.is_empty() {
+        return Err("路径不能为空".into());
+    }
+    let target = PathBuf::from(trimmed);
+    if target.is_file() {
+        Command::new("explorer.exe")
+            .arg(format!("/select,{}", target.display()))
+            .spawn()
+            .map_err(|e| format!("无法打开所在文件夹：{e}"))?;
+        return Ok(());
+    }
+    let dir = if target.is_dir() {
+        target
+    } else if let Some(parent) = target.parent().filter(|p| p.is_dir()) {
+        parent.to_path_buf()
+    } else {
+        return Err(format!("路径不存在：{}", target.display()));
+    };
+    Command::new("explorer.exe")
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| format!("无法打开文件夹：{e}"))?;
+    Ok(())
+}
+
 #[tauri::command]
 async fn create_identity(req: Value) -> Result<Value, String> {
     let name = req["name"].as_str().unwrap_or("").trim().to_string();
@@ -1176,16 +1240,21 @@ fn safe_stem(name: &str) -> String {
     if trimmed.is_empty() { "identity".to_string() } else { trimmed }
 }
 
-/// Export straight into the packs folder instead of asking for a path.
+/// Export into a user-chosen path, or fall back to the managed packs folder.
 #[tauri::command]
-async fn export_pack(id: String, name: String) -> Result<Value, String> {
-    let packs = packs_dir(&project_root());
-    let stem = safe_stem(if name.trim().is_empty() { &id } else { name.trim() });
-    let mut target = packs.join(format!("{stem}.sfx"));
-    if target.exists() {
-        let short: String = id.chars().take(8).collect();
-        target = packs.join(format!("{stem}-{short}.sfx"));
-    }
+async fn export_pack(id: String, name: String, output: Option<String>) -> Result<Value, String> {
+    let target = if let Some(custom) = output.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        PathBuf::from(custom.trim_matches('"'))
+    } else {
+        let packs = packs_dir(&project_root());
+        let stem = safe_stem(if name.trim().is_empty() { &id } else { name.trim() });
+        let mut path = packs.join(format!("{stem}.sfx"));
+        if path.exists() {
+            let short: String = id.chars().take(8).collect();
+            path = packs.join(format!("{stem}-{short}.sfx"));
+        }
+        path
+    };
     let target_text = target.to_string_lossy().to_string();
     let mut value = run_cli_task(vec!["export".into(), id, target_text.clone()]).await?;
     if let Some(obj) = value.as_object_mut() {
@@ -1196,17 +1265,26 @@ async fn export_pack(id: String, name: String) -> Result<Value, String> {
 
 #[tauri::command]
 async fn import_pack(file: String) -> Result<Value, String> {
-    let file = file.trim();
+    let file = file.trim().trim_matches('"');
     if file.is_empty() {
         return Err("请选择身份包".into());
     }
-    if file.contains('/') || file.contains('\\') {
-        return Err("身份包名称不合法".into());
-    }
-    let path = packs_dir(&project_root()).join(file);
-    if !path.is_file() {
-        return Err(format!("找不到身份包：{}", path.display()));
-    }
+    let candidate = PathBuf::from(file);
+    let path = if candidate.is_absolute() {
+        if !candidate.is_file() {
+            return Err(format!("找不到身份包：{}", candidate.display()));
+        }
+        candidate
+    } else {
+        if file.contains('/') || file.contains('\\') {
+            return Err("身份包名称不合法".into());
+        }
+        let managed = packs_dir(&project_root()).join(file);
+        if !managed.is_file() {
+            return Err(format!("找不到身份包：{}", managed.display()));
+        }
+        managed
+    };
     run_cli_task(vec!["import".into(), path.to_string_lossy().to_string()]).await
 }
 
@@ -1307,6 +1385,8 @@ pub fn run() {
             select_python,
             setup_local_python,
             pick_python_path,
+            pick_dialog,
+            reveal_path,
             create_identity,
             edit_identity,
             reorder_identities,

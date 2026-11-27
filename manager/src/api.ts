@@ -115,6 +115,25 @@ export async function setupLocalPython(path?: string | null, proxy = ""): Promis
 export async function pickPythonPath(kind: "dir" | "file"): Promise<string | null> {
   return invoke("pick_python_path", { kind });
 }
+export interface PickDialogOptions {
+  kind: "open_file" | "save_file" | "open_dir";
+  title?: string;
+  filter?: string;
+  defaultName?: string;
+  defaultDir?: string;
+}
+export async function pickDialog(options: PickDialogOptions): Promise<string | null> {
+  return invoke("pick_dialog", {
+    kind: options.kind,
+    title: options.title ?? null,
+    filter: options.filter ?? null,
+    defaultName: options.defaultName ?? null,
+    defaultDir: options.defaultDir ?? null,
+  });
+}
+export async function revealPath(path: string): Promise<void> {
+  return invoke("reveal_path", { path });
+}
 
 export interface EnvironmentCheck {
   ready: boolean;
@@ -185,8 +204,8 @@ export async function reorderIdentities(ids: string[]): Promise<{ order: string[
   return await invoke<{ order: string[] }>("reorder_identities", { ids });
 }
 
-export async function exportPack(id: string, name: string): Promise<{ archive: string; file: string; id: string }> {
-  return await invoke("export_pack", { id, name });
+export async function exportPack(id: string, name: string, output?: string | null): Promise<{ archive: string; file: string; id: string }> {
+  return await invoke("export_pack", { id, name, output: output ?? null });
 }
 
 export async function importPack(file: string): Promise<Identity> {
