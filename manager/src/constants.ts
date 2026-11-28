@@ -20,7 +20,7 @@ export const COUNTRY_OPTIONS = [
 export const OS_LABELS: Record<string, string> = { windows: "Windows", macos: "macOS", linux: "Linux" };
 export const OS_ICONS: Record<string, string> = { windows: "▣", macos: "●", linux: "◆" };
 
-export type View = "overview" | "environments" | "proxy" | "extensions" | "history" | "fonts" | "settings";
+export type View = "overview" | "environments" | "proxy" | "extensions" | "downloads" | "history" | "fonts" | "settings";
 export type SettingsTab = "data" | "runtime" | "about";
 
 export const VIEW_LABEL: Record<View, string> = {
@@ -28,6 +28,7 @@ export const VIEW_LABEL: Record<View, string> = {
   environments: "浏览器环境",
   proxy: "代理管理",
   extensions: "扩展中心",
+  downloads: "下载记录",
   history: "启动记录",
   fonts: "字体库",
   settings: "设置",

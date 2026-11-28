@@ -612,6 +612,7 @@ def cmd_export(args):
 # backups are rebuilt on demand.
 _SKIP_DIRS = {
     "cache", "cache2", "startupCache", "shader-cache", "crashes",
+    ".downloads-staging",
     "sessionstore-backups", "datareporting", "minidumps",
     "saved-telemetry-pings",
 }
@@ -826,6 +827,139 @@ def cmd_cookies(args):
     ]
     destination.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
     return _emit({"archive": str(destination), "id": args.id, "count": len(cookies)})
+
+
+def _parse_same_site(value: Any) -> int:
+    if isinstance(value, int) and value in (0, 1, 2):
+        return value
+    text = str(value or "").strip().lower()
+    if text in ("none", "no_restriction"):
+        return 0
+    if text == "strict":
+        return 2
+    return 1  # Lax default
+
+
+def _ensure_cookies_table(connection: sqlite3.Connection) -> Set[str]:
+    rows = connection.execute("PRAGMA table_info(moz_cookies)").fetchall()
+    if not rows:
+        connection.execute(
+            """
+            CREATE TABLE moz_cookies (
+                id INTEGER PRIMARY KEY,
+                originAttributes TEXT NOT NULL DEFAULT '',
+                name TEXT,
+                value TEXT,
+                host TEXT,
+                path TEXT,
+                expiry INTEGER,
+                lastAccessed INTEGER,
+                creationTime INTEGER,
+                isSecure INTEGER,
+                isHttpOnly INTEGER,
+                inBrowserElement INTEGER DEFAULT 0,
+                sameSite INTEGER DEFAULT 0,
+                rawSameSite INTEGER DEFAULT 0,
+                schemeMap INTEGER DEFAULT 0,
+                CONSTRAINT moz_uniqueid UNIQUE (name, host, path, originAttributes)
+            )
+            """
+        )
+        connection.execute("PRAGMA user_version = 15")
+        rows = connection.execute("PRAGMA table_info(moz_cookies)").fetchall()
+    return {row[1] for row in rows}
+
+
+def cmd_cookies_import(args):
+    """Import Playwright / Cookie-Editor JSON cookies into an identity's cookies.sqlite."""
+    profiles_dir = Path(args.profiles)
+    if runtime_state(profiles_dir, args.id):
+        return _fail("环境正在运行中，请先停止后再导入 Cookie")
+    ident_dir = profiles_dir / args.id
+    if not (ident_dir / "identity.json").is_file():
+        return _fail("找不到目标环境")
+    source = Path(args.input).expanduser()
+    if not source.is_file():
+        return _fail(f"找不到 Cookie 文件：{source}")
+    try:
+        raw = json.loads(source.read_text(encoding="utf-8-sig"))
+    except Exception as e:
+        return _fail(f"Cookie 文件不是有效的 JSON：{e}")
+    if isinstance(raw, dict) and isinstance(raw.get("cookies"), list):
+        raw = raw["cookies"]
+    if not isinstance(raw, list):
+        return _fail("Cookie 文件格式不正确：应为 JSON 数组")
+
+    profile = ident_dir / "profile"
+    profile.mkdir(parents=True, exist_ok=True)
+    database = profile / "cookies.sqlite"
+
+    now_us = int(time.time() * 1_000_000)
+    default_expiry = int(time.time()) + 365 * 24 * 3600
+    imported = 0
+    skipped = 0
+
+    connection = sqlite3.connect(database)
+    try:
+        columns = _ensure_cookies_table(connection)
+        for item in raw:
+            if not isinstance(item, dict):
+                skipped += 1
+                continue
+            name = str(item.get("name") or "")
+            host = str(item.get("domain") or item.get("host") or "").strip()
+            if not name or not host:
+                skipped += 1
+                continue
+            value = str(item.get("value") if item.get("value") is not None else "")
+            path = str(item.get("path") or "/")
+            exp_raw = item.get("expires")
+            if exp_raw is None:
+                exp_raw = item.get("expirationDate")
+            try:
+                expiry = int(float(exp_raw)) if exp_raw is not None else default_expiry
+            except (TypeError, ValueError):
+                expiry = default_expiry
+            if expiry <= 0:
+                expiry = default_expiry
+            is_secure = 1 if item.get("secure") else 0
+            is_http_only = 1 if item.get("httpOnly") else 0
+            same_site = _parse_same_site(item.get("sameSite"))
+            scheme_map = 2 if is_secure else 3  # 2=https, 3=http|https
+
+            record: Dict[str, Any] = {
+                "originAttributes": "",
+                "name": name,
+                "value": value,
+                "host": host,
+                "path": path,
+                "expiry": expiry,
+                "lastAccessed": now_us,
+                "creationTime": now_us,
+                "isSecure": is_secure,
+                "isHttpOnly": is_http_only,
+                "inBrowserElement": 0,
+                "sameSite": same_site,
+                "rawSameSite": same_site,
+                "schemeMap": scheme_map,
+            }
+            if "baseDomain" in columns:
+                parts = host.lstrip(".").split(".")
+                record["baseDomain"] = ".".join(parts[-2:]) if len(parts) >= 2 else host.lstrip(".")
+
+            cols = [c for c in record if c in columns]
+            placeholders = ", ".join("?" for _ in cols)
+            col_sql = ", ".join(cols)
+            connection.execute(
+                f"INSERT OR REPLACE INTO moz_cookies ({col_sql}) VALUES ({placeholders})",
+                [record[c] for c in cols],
+            )
+            imported += 1
+        connection.commit()
+    finally:
+        connection.close()
+
+    return _emit({"id": args.id, "imported": imported, "skipped": skipped, "file": str(source)})
 
 
 def cmd_import(args):
@@ -1182,28 +1316,247 @@ def _unique_download_path(directory: Path, suggested_name: str) -> Path:
     return directory / f"{stem}-{uuid.uuid4().hex[:6]}{suffix}"
 
 
-def _attach_download_persistence(context, downloads_dir: Path) -> None:
+_DOWNLOAD_TOAST_JS = """(payload) => {
+  try {
+    const HOST_ID = "__cacer_download_toast_host__";
+    let host = document.getElementById(HOST_ID);
+    let root;
+    if (!host) {
+      host = document.createElement("div");
+      host.id = HOST_ID;
+      host.style.cssText = "position:fixed;top:16px;right:16px;z-index:2147483647;pointer-events:none;";
+      root = host.attachShadow({ mode: "closed" });
+      const style = document.createElement("style");
+      style.textContent = `
+        .stack { display:flex; flex-direction:column; gap:8px; font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; }
+        .toast {
+          pointer-events:auto; display:flex; align-items:flex-start; gap:10px;
+          min-width:260px; max-width:360px; padding:11px 14px; border-radius:10px;
+          background:#ffffff; color:#18181b; border:1px solid #e4e4e7;
+          box-shadow:0 10px 28px rgba(0,0,0,.14); font-size:13px; line-height:1.45;
+          opacity:0; transform:translateY(-6px); transition:opacity .18s ease, transform .18s ease;
+        }
+        .toast.show { opacity:1; transform:translateY(0); }
+        .dot { width:8px; height:8px; border-radius:999px; margin-top:5px; flex:0 0 auto; background:#16a34a; }
+        .toast.started .dot { background:#2563eb; }
+        .toast.fail .dot { background:#dc2626; }
+        .body { flex:1; min-width:0; }
+        .title { font-weight:600; color:#18181b; }
+        .name { margin-top:2px; color:#27272a; word-break:break-all; }
+        .dir { margin-top:2px; font-size:11.5px; color:#71717a; word-break:break-all; }
+        .close {
+          border:none; background:transparent; color:#71717a; cursor:pointer;
+          font-size:16px; line-height:1; padding:0 2px; flex:0 0 auto;
+        }
+        .close:hover { color:#18181b; }
+      `;
+      const stack = document.createElement("div");
+      stack.className = "stack";
+      root.append(style, stack);
+      (document.documentElement || document.body).appendChild(host);
+      host._cacerStack = stack;
+    }
+    const stack = host._cacerStack;
+    if (!stack) return;
+    const item = document.createElement("div");
+    const state = payload.state || (payload.failed ? "failed" : "completed");
+    item.className = state === "failed" ? "toast fail" : state === "started" ? "toast started" : "toast";
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    const body = document.createElement("div");
+    body.className = "body";
+    const title = document.createElement("div");
+    title.className = "title";
+    title.textContent = state === "failed" ? "下载失败" : state === "started" ? "开始下载" : "下载完成";
+    const name = document.createElement("div");
+    name.className = "name";
+    name.textContent = payload.filename || "download";
+    const dir = document.createElement("div");
+    dir.className = "dir";
+    dir.textContent = state === "failed"
+      ? (payload.directory || "请重试")
+      : state === "started"
+        ? ("正在保存至 " + (payload.directory || ""))
+        : ("已保存至 " + (payload.directory || ""));
+    body.append(title, name, dir);
+    const close = document.createElement("button");
+    close.className = "close";
+    close.type = "button";
+    close.textContent = "×";
+    const remove = () => {
+      item.classList.remove("show");
+      setTimeout(() => {
+        item.remove();
+        if (!stack.childElementCount) host.remove();
+      }, 180);
+    };
+    close.addEventListener("click", remove);
+    item.append(dot, body, close);
+    stack.appendChild(item);
+    requestAnimationFrame(() => item.classList.add("show"));
+    setTimeout(remove, state === "started" ? 3000 : 5000);
+  } catch (_) {}
+}"""
+
+
+def _notify_download_toast(
+    context,
+    page,
+    filename: str,
+    directory: str,
+    state: str = "completed",
+) -> None:
+    """Show a non-intrusive download status toast in the active browser page."""
+    candidates = []
+    if page is not None:
+        candidates.append(page)
+    for existing in reversed(list(getattr(context, "pages", []) or [])):
+        if existing is not page:
+            candidates.append(existing)
+    for target_page in candidates:
+        try:
+            is_closed = getattr(target_page, "is_closed", None)
+            if callable(is_closed) and is_closed():
+                continue
+            target_page.evaluate(
+                _DOWNLOAD_TOAST_JS,
+                {"filename": filename, "directory": directory, "state": state},
+            )
+            return
+        except Exception:
+            continue
+
+
+def _downloads_log_path(profiles_dir: Path) -> Path:
+    data_root = Path(profiles_dir).expanduser().resolve().parent
+    data_root.mkdir(parents=True, exist_ok=True)
+    return data_root / "downloads.json"
+
+
+def _load_download_records(profiles_dir: Path) -> List[Dict[str, Any]]:
+    path = _downloads_log_path(profiles_dir)
+    if not path.is_file():
+        return []
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        return raw if isinstance(raw, list) else []
+    except Exception:
+        return []
+
+
+def _record_download(
+    profiles_dir: Optional[Path],
+    *,
+    filename: str,
+    path: str,
+    directory: str,
+    size: int,
+    identity_id: str,
+    identity_name: str,
+    status: str,
+) -> None:
+    if profiles_dir is None:
+        return
+    try:
+        records = _load_download_records(profiles_dir)
+        records.insert(0, {
+            "id": uuid.uuid4().hex[:12],
+            "filename": filename,
+            "path": path,
+            "directory": directory,
+            "size": max(0, int(size)),
+            "identity_id": identity_id,
+            "identity_name": identity_name,
+            "status": status,
+            "at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+        write_text_atomic(
+            _downloads_log_path(profiles_dir),
+            json.dumps(records[:200], ensure_ascii=False, indent=2),
+        )
+    except Exception:
+        pass
+
+
+def cmd_downloads_list(args):
+    records = _load_download_records(Path(args.profiles))
+    enriched = []
+    for item in records:
+        entry = dict(item)
+        p = entry.get("path") or ""
+        entry["exists"] = bool(p and Path(p).is_file())
+        enriched.append(entry)
+    _emit(enriched)
+    return 0
+
+
+def cmd_downloads_clear(args):
+    path = _downloads_log_path(Path(args.profiles))
+    write_text_atomic(path, "[]")
+    _emit({"ok": True})
+    return 0
+
+
+def _attach_download_persistence(
+    context,
+    downloads_dir: Path,
+    *,
+    profiles_dir: Optional[Path] = None,
+    identity_id: str = "",
+    identity_name: str = "",
+) -> None:
     """Persist Playwright-intercepted downloads with their real filenames on the host.
 
-    Playwright stores downloads under UUID names in a temporary artifact folder
-    and deletes them when the browser closes. Saving each download explicitly
-    keeps the user's downloaded files in their host Downloads folder.
+    Playwright stores downloads under UUID names in a temporary staging folder.
+    Saving each download explicitly keeps the user's downloaded files in their
+    host Downloads folder, deletes the staging artifact, records the download
+    for Cacer Manager's Downloads view, and shows start/finish toasts in the
+    browser window.
     """
     downloads_dir.mkdir(parents=True, exist_ok=True)
     attached: Set[int] = set()
-
-    def _on_download(download) -> None:
-        try:
-            target = _unique_download_path(downloads_dir, getattr(download, "suggested_filename", "") or "download")
-            download.save_as(str(target))
-        except Exception:
-            pass
 
     def _bind(page) -> None:
         key = id(page)
         if key in attached:
             return
         attached.add(key)
+
+        def _on_download(download) -> None:
+            suggested = getattr(download, "suggested_filename", "") or "download"
+            _notify_download_toast(context, page, suggested, str(downloads_dir), state="started")
+            try:
+                target = _unique_download_path(downloads_dir, suggested)
+                download.save_as(str(target))
+                try:
+                    download.delete()
+                except Exception:
+                    pass
+                size = target.stat().st_size if target.is_file() else 0
+                _record_download(
+                    profiles_dir,
+                    filename=target.name,
+                    path=str(target),
+                    directory=str(target.parent),
+                    size=size,
+                    identity_id=identity_id,
+                    identity_name=identity_name,
+                    status="completed",
+                )
+                _notify_download_toast(context, page, target.name, str(target.parent), state="completed")
+            except Exception:
+                _record_download(
+                    profiles_dir,
+                    filename=suggested,
+                    path="",
+                    directory=str(downloads_dir),
+                    size=0,
+                    identity_id=identity_id,
+                    identity_name=identity_name,
+                    status="failed",
+                )
+                _notify_download_toast(context, page, suggested, str(downloads_dir), state="failed")
+
         try:
             page.on("download", _on_download)
         except Exception:
@@ -1256,7 +1609,13 @@ def cmd_run(args):
                 profiles_dir, args.id,
                 _run_state(ident, "running", mihomo, proxy_override),
             )
-            _attach_download_persistence(browser, Path(opts.get("downloads_path") or host_downloads_dir()))
+            _attach_download_persistence(
+                browser,
+                host_downloads_dir(),
+                profiles_dir=profiles_dir,
+                identity_id=ident.id,
+                identity_name=ident.name,
+            )
             # The persistent context already opens one page of its own;
             # reusing it instead of new_page() avoids double windows.
             page = browser.pages[0] if browser.pages else browser.new_page()
@@ -1571,19 +1930,28 @@ def main(argv: Optional[List[str]] = None) -> int:
     p = sub.add_parser("ext-remove")
     p.add_argument("--slug", required=True)
 
+    sub.add_parser("downloads-list")
+    sub.add_parser("downloads-clear")
+
+    p = sub.add_parser("cookies-import")
+    p.add_argument("id")
+    p.add_argument("--input", required=True)
+
     p = sub.add_parser("_run")
     p.add_argument("id")
 
     args = ap.parse_args(argv)
     migrate_legacy_profiles(Path(args.profiles))
     handlers = {
-        "list": cmd_list, "create": cmd_create, "clone": cmd_clone, "export": cmd_export, "cookies": cmd_cookies, "import": cmd_import, "rebuild": cmd_rebuild, "delete": cmd_delete,
+        "list": cmd_list, "create": cmd_create, "clone": cmd_clone, "export": cmd_export, "cookies": cmd_cookies, "cookies-import": cmd_cookies_import, "import": cmd_import, "rebuild": cmd_rebuild, "delete": cmd_delete,
         "export-all": cmd_export_all, "import-all": cmd_import_all,
         "edit": cmd_edit, "launch": cmd_launch, "stop": cmd_stop, "stop-all": cmd_stop_all,
         "font-requirements": cmd_font_requirements,
         "reorder": cmd_reorder,
         "status": cmd_status, "_run": cmd_run,
         "history": cmd_history,
+        "downloads-list": cmd_downloads_list,
+        "downloads-clear": cmd_downloads_clear,
         "proxy-sources": cmd_proxy_sources, "proxy-nodes": cmd_proxy_nodes,
         "proxy-import": cmd_proxy_import, "proxy-rename": cmd_proxy_rename,
         "proxy-delete": cmd_proxy_delete,
@@ -1599,7 +1967,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # when committing. Other mutations retain the full-command lock.
     mutating = {
         "delete", "edit", "reorder",
-        "launch", "stop", "stop-all", "import", "import-all",
+        "launch", "stop", "stop-all", "import", "import-all", "cookies-import",
         "proxy-rename", "proxy-delete", "proxy-set-core",
         "ext-remove",
     }

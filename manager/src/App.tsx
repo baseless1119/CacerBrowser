@@ -1,12 +1,12 @@
 import { useEffect, useRef, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { getVersion } from "@tauri-apps/api/app";
 import {
-  ClashConfig, CreateRequest, DataOverview, EditRequest, ExtensionItem, ExtensionSearchResult, HistoryItem, Identity, ProxyNode, ProxySource,
-  cancelRuntime, installRuntime, runtimeStatus, setupLocalPython, pickPythonPath, pickDialog, revealPath, type RuntimeStatus,
+  ClashConfig, CreateRequest, DataOverview, DownloadRecord, EditRequest, ExtensionItem, ExtensionSearchResult, HistoryItem, Identity, ProxyNode, ProxySource,
+  cancelRuntime, clearDownloads, installRuntime, listDownloads, runtimeStatus, setupLocalPython, pickPythonPath, pickDialog, revealPath, type RuntimeStatus,
   checkUpdate, downloadUpdate, updateStatus, cancelUpdate, installUpdate, type UpdateInfo, type UpdateStatus,
   saveDownloadSettings, downloadSettings, testDownloadProxy, importRuntimeArchive, openRuntimeDownloadsDir, fontOverview, type FontOverview,
   clashConfigs, cloneIdentity, createIdentity, dataOverview, deleteIdentity, editIdentity, environmentCheck,
-  exportAllData, exportCookies, exportPack, extImport, extInstall, extList, extRemove, extSearch, importAllData, importPack, launchHistory, launchIdentity, listIdentities, openDataDir,
+  exportAllData, exportCookies, exportPack, extImport, extInstall, extList, extRemove, extSearch, importAllData, importCookies, importPack, launchHistory, launchIdentity, listIdentities, openDataDir,
   proxyDelete, proxyImport, proxyNodes, proxyRename, proxySetCore, proxySources, rebuildIdentity, reorderIdentities, stopIdentity, stopAllIdentities, type EnvironmentCheck,
 } from "./api";
 import {
@@ -21,6 +21,7 @@ import Modal from "./Modal";
 import { IdentityFormFields, type IdentityFormData, type NetChoice } from "./components/IdentityForm";
 import { DownloadProgress, EnvChecks, Icon, PendingButton, SectionTitle, type EnvCardAction } from "./components/Ui";
 import { useDialogs } from "./hooks/useDialogs";
+import DownloadsView from "./views/DownloadsView";
 import EnvironmentsView from "./views/EnvironmentsView";
 import SettingsView from "./views/SettingsView";
 
@@ -118,6 +119,7 @@ export default function App() {
   const [clashLabels, setClashLabels] = useState<Record<string, string>>({});
   const [subBusy, setSubBusy] = useState<string | null>(null);
   const [dataInfo, setDataInfo] = useState<DataOverview | null>(null);
+  const [downloads, setDownloads] = useState<DownloadRecord[]>([]);
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [noteTip, setNoteTip] = useState<{ x: number; y: number; above: boolean; text: string } | null>(null);
   const [extItems, setExtItems] = useState<ExtensionItem[]>([]);
@@ -153,6 +155,7 @@ export default function App() {
   useEffect(() => {
     if (view === "proxy") loadProxy();
     if (view === "extensions") loadExtensions();
+    if (view === "downloads") loadDownloads();
     if (view === "history") loadHistory();
     if (view === "overview" || view === "proxy" || view === "settings") loadData();
   }, [view]);
@@ -166,6 +169,31 @@ export default function App() {
     setSettingsTab(tab);
     setView("settings");
     loadData();
+  }
+
+  async function loadDownloads() {
+    try {
+      setDownloads(await listDownloads());
+    } catch (e) {
+      dialogs.showError(e);
+    }
+  }
+
+  async function handleClearDownloads() {
+    const res = await dialogs.showConfirm({
+      title: "清空下载记录",
+      message: "仅清空这里的历史记录，不会删除电脑上已保存的文件。",
+      confirmLabel: "清空",
+      tone: "danger",
+    });
+    if (!res.confirmed) return;
+    try {
+      await clearDownloads();
+      setDownloads([]);
+      dialogs.showToast("下载记录已清空", "success");
+    } catch (e) {
+      dialogs.showError(e);
+    }
   }
 
   function refresh(afterMutation = false): Promise<void> {
@@ -831,6 +859,24 @@ export default function App() {
     }, "导出 Cookie 失败");
   }
 
+  async function importCookiesTarget(target: Identity) {
+    let chosen: string | null;
+    try {
+      chosen = await pickDialog({
+        kind: "open_file",
+        title: "导入 Cookie",
+        filter: "Cookie JSON (*.json)|*.json",
+        defaultDir: "downloads",
+      });
+    } catch (e) { dialogs.showError(e, "无法打开文件选择窗口"); return; }
+    if (!chosen) return;
+    await withBusy(`cookies-import-${target.id}`, async () => {
+      const result = await importCookies(target.id, chosen!);
+      const extra = result.skipped > 0 ? `（跳过 ${result.skipped} 条无效项）` : "";
+      dialogs.showToast(`已导入 ${result.imported} 条 Cookie${extra}`, "success");
+    }, "导入 Cookie 失败");
+  }
+
   async function importIdentityFile() {
     let chosen: string | null;
     try {
@@ -1035,6 +1081,7 @@ export default function App() {
           <a className={`nav-item ${view === "environments" ? "active" : ""}`} onClick={() => setView("environments")}><Icon>▦</Icon>浏览器环境<span className="nav-count">{identities.length}</span></a>
           <a className={`nav-item ${view === "proxy" ? "active" : ""}`} onClick={() => setView("proxy")}><Icon>⌁</Icon>代理管理</a>
           <a className={`nav-item ${view === "extensions" ? "active" : ""}`} onClick={() => setView("extensions")}><Icon>⧩</Icon>扩展中心<span className="nav-count">{extItems.length}</span></a>
+          <a className={`nav-item ${view === "downloads" ? "active" : ""}`} onClick={() => setView("downloads")}><Icon>↓</Icon>下载记录</a>
           <a className={`nav-item ${view === "history" ? "active" : ""}`} onClick={() => setView("history")}><Icon>◷</Icon>启动记录</a>
           <div className="nav-group-title second">系统</div>
           <a className={`nav-item ${view === "fonts" ? "active" : ""}`} onClick={() => setView("fonts")}><Icon>文</Icon>字体库</a>
@@ -1097,6 +1144,7 @@ export default function App() {
               onClone={cloneTarget}
               onExport={exportTarget}
               onExportCookies={exportCookiesTarget}
+              onImportCookies={importCookiesTarget}
               onDelete={remove}
               onReorder={handleReorder}
               onShowNoteTip={showNoteTip}
@@ -1305,6 +1353,15 @@ export default function App() {
             </>
           )}
 
+          {view === "downloads" && (
+            <DownloadsView
+              items={downloads}
+              onRefresh={loadDownloads}
+              onClear={handleClearDownloads}
+              onReveal={(p) => revealPath(p).catch((e) => dialogs.showError(e))}
+            />
+          )}
+
           {view === "history" && (
             <>
               <div className="page-heading">
@@ -1412,6 +1469,7 @@ export default function App() {
           <div className="modal-footer edit-footer">
             <div className="edit-transfer-actions">
               <PendingButton className="secondary" onClick={() => exportCookiesTarget(editTarget)} disabled={editBusy} busy={busy.has(`cookies-${editTarget.id}`)} idle="导出 Cookie" pending="导出中…" />
+              <PendingButton className="secondary" onClick={() => importCookiesTarget(editTarget)} disabled={editBusy || editTarget.running || editTarget.status === "starting"} busy={busy.has(`cookies-import-${editTarget.id}`)} idle="导入 Cookie" pending="导入中…" />
               <PendingButton className="secondary" onClick={() => exportTarget(editTarget)} disabled={editLive || editBusy} busy={busy.has(`export-${editTarget.id}`)} idle="导出身份" pending="导出中…" />
               <PendingButton className="secondary" onClick={() => cloneTarget(editTarget)} disabled={editLive || editBusy} busy={busy.has(`clone-${editTarget.id}`)} idle="复制为新环境" pending="复制中…" />
             </div>

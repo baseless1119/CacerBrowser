@@ -1033,6 +1033,18 @@ async fn export_cookies(id: String, output: String) -> Result<Value, String> {
 }
 
 #[tauri::command]
+async fn import_cookies(id: String, input: String) -> Result<Value, String> {
+    if input.trim().is_empty() { return Err("请选择 Cookie 文件".into()); }
+    run_cli_task(vec![
+        "cookies-import".into(),
+        id,
+        "--input".into(),
+        input.trim().to_string(),
+    ])
+    .await
+}
+
+#[tauri::command]
 async fn rebuild_identity(id: String, os: String, country: String) -> Result<Value, String> {
     let mut args: Vec<String> =
         vec!["rebuild".into(), id, "--max-draws".into(), "80".into()];
@@ -1388,6 +1400,16 @@ async fn launch_history(limit: usize) -> Result<Value, String> {
     run_cli_task(vec!["history".into(), "--limit".into(), limit]).await
 }
 
+#[tauri::command]
+async fn list_downloads() -> Result<Value, String> {
+    run_cli_task(vec!["downloads-list".into()]).await
+}
+
+#[tauri::command]
+async fn clear_downloads() -> Result<Value, String> {
+    run_cli_task(vec!["downloads-clear".into()]).await
+}
+
 // ------------------------------------------------------------ self update
 
 /// Keep the official GitHub API request off the async worker.
@@ -1447,6 +1469,7 @@ pub fn run() {
             reorder_identities,
             clone_identity,
             export_cookies,
+            import_cookies,
             rebuild_identity,
             delete_identity,
             launch_identity,
@@ -1477,6 +1500,8 @@ pub fn run() {
             update_status,
             cancel_update,
             install_update,
+            list_downloads,
+            clear_downloads,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

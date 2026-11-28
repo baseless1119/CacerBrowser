@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json as _json
 import logging
+import shutil
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -56,6 +57,9 @@ USERCHROME_CSS = """\
   order: 900 !important;
   -moz-box-ordinal-group: 900 !important;
 }
+/* Playwright's Juggler intercepts downloads before Firefox's Downloads.jsm,
+   so the native downloads button would always show an empty list. */
+#downloads-button { display: none !important; }
 """
 
 
@@ -76,7 +80,7 @@ TABS_TOOLBAR_DEFAULT = [
 NAVBAR_DEFAULT = [
     "back-button", "forward-button", "stop-reload-button",
     "spring", "vertical-spacer", "urlbar-container",
-    "spring", "downloads-button", "unified-extensions-button",
+    "spring", "unified-extensions-button",
 ]
 
 
@@ -376,6 +380,10 @@ def build_launch_options(
     }
 
     downloads_dir = host_downloads_dir()
+    profile = profile_dir(profiles_dir, identity.id, marker_label)
+    staging_dir = profile / ".downloads-staging"
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    staging_dir.mkdir(parents=True, exist_ok=True)
     options: Dict[str, Any] = {
         "fingerprint": identity.fingerprint,
         "config": config,
@@ -385,9 +393,13 @@ def build_launch_options(
         "headless": False,
         "humanize": True,
         "persistent_context": True,
-        "user_data_dir": str(profile_dir(profiles_dir, identity.id, marker_label)),
+        "user_data_dir": str(profile),
         "accept_downloads": True,
-        "downloads_path": str(downloads_dir),
+        # Keep Playwright's temporary extensionless UUID artifacts out of the
+        # user's real Downloads folder; _attach_download_persistence saves the
+        # completed file under its real name into host_downloads_dir() and
+        # deletes the staging copy.
+        "downloads_path": str(staging_dir),
     }
 
     from .engine import bundled_executable
@@ -438,7 +450,7 @@ def build_launch_options(
         "browser.download.folderList": 2,
         "browser.download.dir": str(downloads_dir),
         "browser.download.useDownloadDir": True,
-        "browser.download.alwaysOpenPanel": True,
+        "browser.download.alwaysOpenPanel": False,
     })
     if identity.network_mode == "direct" and not proxy_override:
         # Omitting Playwright's proxy option leaves Firefox using the system

@@ -143,6 +143,27 @@ export async function revealPath(path: string): Promise<void> {
   return invoke("reveal_path", { path });
 }
 
+export interface DownloadRecord {
+  id: string;
+  filename: string;
+  path: string;
+  directory: string;
+  size: number;
+  identity_id: string;
+  identity_name: string;
+  status: "completed" | "failed" | string;
+  at: string;
+  exists: boolean;
+}
+
+export async function listDownloads(): Promise<DownloadRecord[]> {
+  return invoke<DownloadRecord[]>("list_downloads");
+}
+
+export async function clearDownloads(): Promise<{ ok: boolean }> {
+  return invoke<{ ok: boolean }>("clear_downloads");
+}
+
 export interface EnvironmentCheck {
   ready: boolean;
   python_detected: boolean;
@@ -242,6 +263,10 @@ export async function launchHistory(limit = 100): Promise<{ items: HistoryItem[]
 
 export async function exportCookies(id: string, output: string): Promise<{ archive: string; id: string; count: number }> {
   return await invoke("export_cookies", { id, output });
+}
+
+export async function importCookies(id: string, input: string): Promise<{ id: string; imported: number; skipped: number; file: string }> {
+  return await invoke("import_cookies", { id, input });
 }
 
 export async function rebuildIdentity(id: string, os: string, country: string): Promise<Identity> {

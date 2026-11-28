@@ -19,6 +19,7 @@ export default function EnvironmentsView(props: {
   onClone: (it: Identity) => void;
   onExport: (it: Identity) => void;
   onExportCookies: (it: Identity) => void;
+  onImportCookies: (it: Identity) => void;
   onDelete: (it: Identity) => void;
   onReorder: (ids: string[]) => void;
   onShowNoteTip: (event: ReactMouseEvent<HTMLSpanElement>, note: string) => void;
@@ -282,6 +283,14 @@ export default function EnvironmentsView(props: {
           </button>
           <button type="button" role="menuitem" onClick={() => { setMenuOpen(null); props.onExportCookies(menuTarget); }}>
             导出 Cookie (.json)
+          </button>
+          <button
+            type="button"
+            role="menuitem"
+            disabled={menuTarget.running || menuTarget.status === "starting"}
+            onClick={() => { setMenuOpen(null); props.onImportCookies(menuTarget); }}
+          >
+            导入 Cookie (.json)
           </button>
           <div className="row-menu-sep" />
           <button

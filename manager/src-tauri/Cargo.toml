@@ -1,6 +1,6 @@
 [package]
 name = "shadowfox-manager"
-version = "0.1.12"
+version = "0.1.13"
 description = "Cacer fingerprint-identity browser manager"
 edition = "2021"
 
