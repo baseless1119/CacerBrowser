@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json as _json
 import logging
+import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -294,6 +295,51 @@ def required_font_families(identity) -> list[str]:
     return config.get("fonts", [])
 
 
+def _windows_known_downloads() -> Optional[Path]:
+    """Query Windows Shell for the user's actual Downloads folder (respects
+    relocation to D:\\Downloads, etc. via Explorer Properties -> Location)."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _GUID(ctypes.Structure):
+            _fields_ = [
+                ("Data1", wintypes.DWORD),
+                ("Data2", wintypes.WORD),
+                ("Data3", wintypes.WORD),
+                ("Data4", ctypes.c_ubyte * 8),
+            ]
+
+        # FOLDERID_Downloads = {374DE290-123F-4565-9164-39C4925E467B}
+        folder_id = _GUID(
+            0x374DE290, 0x123F, 0x4565,
+            (ctypes.c_ubyte * 8)(0x91, 0x64, 0x39, 0xC4, 0x92, 0x5E, 0x46, 0x7B),
+        )
+        ptr = ctypes.c_wchar_p()
+        hr = ctypes.windll.shell32.SHGetKnownFolderPath(
+            ctypes.byref(folder_id), 0, None, ctypes.byref(ptr),
+        )
+        if hr == 0 and ptr.value:
+            resolved = Path(ptr.value)
+            ctypes.windll.ole32.CoTaskMemFree(ptr)
+            return resolved
+    except Exception:
+        pass
+    return None
+
+
+def host_downloads_dir() -> Path:
+    """Return the host user's actual Downloads directory (including relocated drives)."""
+    downloads = _windows_known_downloads() or (Path.home() / "Downloads")
+    try:
+        downloads.mkdir(parents=True, exist_ok=True)
+        return downloads
+    except OSError:
+        return Path.home()
+
+
 def build_launch_options(
     identity,
     *,
@@ -329,6 +375,7 @@ def build_launch_options(
         "timezone": identity.geo.timezone,
     }
 
+    downloads_dir = host_downloads_dir()
     options: Dict[str, Any] = {
         "fingerprint": identity.fingerprint,
         "config": config,
@@ -339,6 +386,8 @@ def build_launch_options(
         "humanize": True,
         "persistent_context": True,
         "user_data_dir": str(profile_dir(profiles_dir, identity.id, marker_label)),
+        "accept_downloads": True,
+        "downloads_path": str(downloads_dir),
     }
 
     from .engine import bundled_executable
@@ -386,6 +435,10 @@ def build_launch_options(
     user_prefs.update({
         "extensions.autoDisableScopes": 0,
         "xpinstall.signatures.required": False,
+        "browser.download.folderList": 2,
+        "browser.download.dir": str(downloads_dir),
+        "browser.download.useDownloadDir": True,
+        "browser.download.alwaysOpenPanel": True,
     })
     if identity.network_mode == "direct" and not proxy_override:
         # Omitting Playwright's proxy option leaves Firefox using the system

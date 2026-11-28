@@ -38,7 +38,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from .fsutil import write_text_atomic
 from .identity import Identity, create_identity, next_sort_order
-from .launcher import build_launch_options
+from .launcher import build_launch_options, host_downloads_dir
 from .extensions import (
     import_local as import_extension,
     install_from_amo,
@@ -631,12 +631,11 @@ def _running_ids(profiles_dir: Path) -> List[str]:
 
 
 def _archive_path(raw: str) -> Path:
-    """Absolute paths are used as-is; a bare name lands in Downloads."""
+    """Absolute paths are used as-is; a bare name lands in the user's Downloads."""
     path = Path(raw).expanduser()
     if path.is_absolute():
         return path
-    downloads = Path.home() / "Downloads"
-    return (downloads if downloads.is_dir() else Path.home()) / path
+    return host_downloads_dir() / path
 
 
 # Only user-owned state is portable. Debug leftovers (browser dumps, arti
@@ -1165,6 +1164,59 @@ def _run_state(ident, status, mihomo=None, proxy_server=None):
     return state
 
 
+def _unique_download_path(directory: Path, suggested_name: str) -> Path:
+    """Resolve a non-colliding host path inside Downloads for a browser download."""
+    raw = Path(suggested_name or "download").name
+    cleaned = "".join("_" if c in '<>:"/\\|?*' or ord(c) < 32 else c for c in raw).strip(" .")
+    if not cleaned:
+        cleaned = "download"
+    candidate = directory / cleaned
+    if not candidate.exists():
+        return candidate
+    stem = candidate.stem or "download"
+    suffix = candidate.suffix
+    for idx in range(1, 1000):
+        numbered = directory / f"{stem} ({idx}){suffix}"
+        if not numbered.exists():
+            return numbered
+    return directory / f"{stem}-{uuid.uuid4().hex[:6]}{suffix}"
+
+
+def _attach_download_persistence(context, downloads_dir: Path) -> None:
+    """Persist Playwright-intercepted downloads with their real filenames on the host.
+
+    Playwright stores downloads under UUID names in a temporary artifact folder
+    and deletes them when the browser closes. Saving each download explicitly
+    keeps the user's downloaded files in their host Downloads folder.
+    """
+    downloads_dir.mkdir(parents=True, exist_ok=True)
+    attached: Set[int] = set()
+
+    def _on_download(download) -> None:
+        try:
+            target = _unique_download_path(downloads_dir, getattr(download, "suggested_filename", "") or "download")
+            download.save_as(str(target))
+        except Exception:
+            pass
+
+    def _bind(page) -> None:
+        key = id(page)
+        if key in attached:
+            return
+        attached.add(key)
+        try:
+            page.on("download", _on_download)
+        except Exception:
+            pass
+
+    for existing in list(getattr(context, "pages", []) or []):
+        _bind(existing)
+    try:
+        context.on("page", _bind)
+    except Exception:
+        pass
+
+
 def cmd_run(args):
     """Internal: detached process that owns the browser until the window closes."""
     profiles_dir = Path(args.profiles)
@@ -1204,6 +1256,7 @@ def cmd_run(args):
                 profiles_dir, args.id,
                 _run_state(ident, "running", mihomo, proxy_override),
             )
+            _attach_download_persistence(browser, Path(opts.get("downloads_path") or host_downloads_dir()))
             # The persistent context already opens one page of its own;
             # reusing it instead of new_page() avoids double windows.
             page = browser.pages[0] if browser.pages else browser.new_page()
