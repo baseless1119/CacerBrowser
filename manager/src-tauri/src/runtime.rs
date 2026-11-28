@@ -1,10 +1,12 @@
 //! Download fixed, build-verified runtimes without requiring Python to exist.
+use crate::task::{MIRRORS, TaskControl, TaskStatus};
+#[cfg(test)]
+use crate::task::windows_proxy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{atomic::{AtomicBool, Ordering}, Mutex};
 use std::time::Duration;
 
 #[derive(Clone, Deserialize)]
@@ -34,41 +36,17 @@ pub struct FontPack {
     #[serde(flatten)]
     pub asset: Asset,
 }
-#[derive(Clone, Default, Serialize)]
-pub struct Status {
-    pub busy: bool,
-    pub message: String,
-    pub downloaded: u64,
-    pub total: u64,
-}
-static STATUS: Mutex<Status> = Mutex::new(Status {
-    busy: false, message: String::new(), downloaded: 0, total: 0,
-});
-static CANCEL: AtomicBool = AtomicBool::new(false);
+pub type Status = TaskStatus;
+static TASK: TaskControl = TaskControl::new();
 
-pub fn status() -> Status { STATUS.lock().unwrap().clone() }
-pub fn cancel() { CANCEL.store(true, Ordering::Relaxed); }
-pub(crate) fn cancelled() -> Result<(), String> {
-    if CANCEL.load(Ordering::Relaxed) { Err("已取消，可重新尝试".into()) } else { Ok(()) }
-}
+pub fn status() -> Status { TASK.status() }
+pub fn cancel() { TASK.cancel(); }
+pub(crate) fn cancelled() -> Result<(), String> { TASK.cancelled("已取消，可重新尝试") }
 pub(crate) fn progress(message: &str, downloaded: u64, total: u64) {
-    let mut state = STATUS.lock().unwrap();
-    state.message = message.into();
-    state.downloaded = downloaded;
-    state.total = total;
+    TASK.progress(message, downloaded, total);
 }
 pub fn operation<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-    {
-        let mut state = STATUS.lock().unwrap();
-        if state.busy { return Err("另一个运行时安装正在进行".into()); }
-        CANCEL.store(false, Ordering::Relaxed);
-        *state = Status { busy: true, message: "正在准备".into(), ..Default::default() };
-    }
-    let result = work();
-    let mut state = STATUS.lock().unwrap();
-    state.busy = false;
-    state.message = match &result { Ok(_) => "准备完成".into(), Err(error) => error.clone() };
-    result
+    TASK.run("另一个运行时安装正在进行", "正在准备", 0, "准备完成", work)
 }
 pub fn resource_dir(root: &Path) -> PathBuf {
     let packaged = root.join("resources/runtime");
@@ -278,7 +256,7 @@ fn run_cancellable_command(
     });
     let started = std::time::Instant::now();
     let status = loop {
-        if CANCEL.load(Ordering::Relaxed) {
+        if TASK.is_cancelled() {
             let _ = child.kill();
             let _ = child.wait();
             return Err("已取消，可重新尝试".into());
@@ -385,9 +363,7 @@ pub fn setup_local_python(root: &Path, input_path: Option<&str>, proxy: &str) ->
         }
         let settings = download_settings(root);
         let explicit_proxy = if proxy.trim().is_empty() { settings.proxy } else { proxy.to_string() };
-        let system = super::system_proxy().ok()
-            .filter(|sys| sys["enabled"].as_bool() == Some(true))
-            .and_then(|sys| sys["server"].as_str().and_then(windows_proxy));
+        let system = crate::task::system_proxy_url();
         let mut routes: Vec<(Option<&str>, Option<&str>, String, String)> = Vec::new();
         if !explicit_proxy.trim().is_empty() {
             routes.push((None, None, explicit_proxy.trim().to_string(), "指定代理".into()));
@@ -471,8 +447,8 @@ pub fn setup_local_python(root: &Path, input_path: Option<&str>, proxy: &str) ->
     }
     venv_result
 }
-/// Open a native Windows folder, open-file, or save-file dialog without extra crate dependencies.
-/// All user-facing strings are passed via environment variables to avoid PowerShell quoting issues.
+/// Open a native Windows folder, open-file, or save-file dialog directly via Win32
+/// so the dialog opens immediately and always follows the Windows system UI language.
 pub fn pick_dialog(
     kind: &str,
     title: Option<&str>,
@@ -480,74 +456,7 @@ pub fn pick_dialog(
     default_name: Option<&str>,
     default_dir: Option<&str>,
 ) -> Result<Option<String>, String> {
-    let script = match kind {
-        "dir" | "open_dir" => r#"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-Add-Type -AssemblyName System.Windows.Forms
-$owner = New-Object System.Windows.Forms.Form
-$owner.TopMost = $true
-$dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-$dialog.Description = if ($env:CACER_DLG_TITLE) { $env:CACER_DLG_TITLE } else { '选择文件夹' }
-$dialog.ShowNewFolderButton = $false
-if ($env:CACER_DLG_DIR -and (Test-Path -LiteralPath $env:CACER_DLG_DIR)) {
-    $dialog.SelectedPath = $env:CACER_DLG_DIR
-}
-if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
-    [Console]::Write($dialog.SelectedPath)
-}
-$owner.Dispose()"#,
-        "file" | "open_file" => r#"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-Add-Type -AssemblyName System.Windows.Forms
-$owner = New-Object System.Windows.Forms.Form
-$owner.TopMost = $true
-$dialog = New-Object System.Windows.Forms.OpenFileDialog
-$dialog.Title = if ($env:CACER_DLG_TITLE) { $env:CACER_DLG_TITLE } else { '选择文件' }
-$dialog.Filter = if ($env:CACER_DLG_FILTER) { $env:CACER_DLG_FILTER } else { '所有文件 (*.*)|*.*' }
-if ($env:CACER_DLG_DIR -and (Test-Path -LiteralPath $env:CACER_DLG_DIR)) {
-    $dialog.InitialDirectory = $env:CACER_DLG_DIR
-}
-if ($env:CACER_DLG_NAME) {
-    $dialog.FileName = $env:CACER_DLG_NAME
-}
-if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
-    [Console]::Write($dialog.FileName)
-}
-$owner.Dispose()"#,
-        "save_file" => r#"[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-Add-Type -AssemblyName System.Windows.Forms
-$owner = New-Object System.Windows.Forms.Form
-$owner.TopMost = $true
-$dialog = New-Object System.Windows.Forms.SaveFileDialog
-$dialog.Title = if ($env:CACER_DLG_TITLE) { $env:CACER_DLG_TITLE } else { '保存文件' }
-$dialog.Filter = if ($env:CACER_DLG_FILTER) { $env:CACER_DLG_FILTER } else { '所有文件 (*.*)|*.*' }
-$dialog.AddExtension = $true
-$dialog.OverwritePrompt = $true
-if ($env:CACER_DLG_DIR -and (Test-Path -LiteralPath $env:CACER_DLG_DIR)) {
-    $dialog.InitialDirectory = $env:CACER_DLG_DIR
-}
-if ($env:CACER_DLG_NAME) {
-    $dialog.FileName = $env:CACER_DLG_NAME
-}
-if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
-    [Console]::Write($dialog.FileName)
-}
-$owner.Dispose()"#,
-        _ => return Err("未知选择类型".into()),
-    };
-    let mut cmd = super::silent_command("powershell.exe");
-    cmd.args(["-NoProfile", "-STA", "-Command", script])
-        .env("CACER_DLG_TITLE", title.unwrap_or(""))
-        .env("CACER_DLG_FILTER", filter.unwrap_or(""))
-        .env("CACER_DLG_NAME", default_name.unwrap_or(""))
-        .env("CACER_DLG_DIR", default_dir.unwrap_or(""));
-    let output = cmd
-        .output()
-        .map_err(|e| format!("无法打开系统选择窗口：{e}"))?;
-    if !output.status.success() {
-        let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if err.is_empty() { "打开系统选择窗口失败".into() } else { err });
-    }
-    let chosen = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    Ok((!chosen.is_empty()).then_some(chosen))
+    crate::win_dialog::pick(kind, title, filter, default_name, default_dir)
 }
 pub fn pick_python_location(kind: &str) -> Result<Option<String>, String> {
     match kind {
@@ -603,50 +512,155 @@ pub fn save_download_settings(root: &Path, settings: &DownloadSettings) -> Resul
     fs::write(cache(root).join("download-settings.json"),
         serde_json::to_vec(settings).map_err(|e| e.to_string())?).map_err(|e| e.to_string())
 }
-pub(crate) fn windows_proxy(server: &str) -> Option<String> {
-    let value = server.split(';').find_map(|entry| entry.strip_prefix("https="))
-        .or_else(|| server.split(';').find_map(|entry| entry.strip_prefix("http=")))
-        .or_else(|| (!server.contains('=')).then_some(server))?;
-    Some(if value.contains("://") { value.to_string() } else { format!("http://{value}") })
+fn asset_filename(asset: &Asset) -> Option<String> {
+    let url = reqwest::Url::parse(&asset.url).ok()?;
+    let name = url.path_segments()?.next_back()?.trim();
+    if name.is_empty() || name.contains(['/', '\\', ':']) || matches!(name, "." | "..") {
+        return None;
+    }
+    Some(name.to_string())
 }
-/// Public GitHub proxies tried in order before touching GitHub directly.
-/// They are hard-coded so a download never depends on user input.
-pub(crate) const MIRRORS: [&str; 5] = [
-    "https://ghfast.top",
-    "https://gh-proxy.com",
-    "https://github.moeyy.xyz",
-    "https://ghproxy.net",
-    "https://gh.llkk.cc",
-];
+/// Directory where downloaded or manually placed runtime/font ZIP archives are cached.
+pub fn downloads_dir(root: &Path) -> PathBuf {
+    cache(root).join("downloads")
+}
+/// Verify a candidate ZIP archive against the manifest size and SHA256 digest.
+fn matches_asset(path: &Path, asset: &Asset) -> Result<bool, String> {
+    if !path.is_file() {
+        return Ok(false);
+    }
+    if fs::metadata(path).map_err(|e| e.to_string())?.len() != asset.size {
+        return Ok(false);
+    }
+    Ok(digest_file(path)? == asset.sha256)
+}
+/// Import a manually downloaded font/python ZIP from anywhere on disk into the
+/// verified downloads cache so subsequent installation works completely offline.
+pub fn import_archive(root: &Path, path: &str) -> Result<serde_json::Value, String> {
+    let source = PathBuf::from(path.trim().trim_matches('"'));
+    if !source.is_file() {
+        return Err("请选择有效的 ZIP 文件".into());
+    }
+    let manifest = manifest(root)?;
+    let size = fs::metadata(&source).map_err(|e| e.to_string())?.len();
+    progress("正在校验离线包 SHA256…", 0, size);
+    let hash = digest_file(&source)?;
+    let matched = if manifest.python.size == size && manifest.python.sha256 == hash {
+        Some(("python".to_string(), "python".to_string(), "独立 Python 运行时".to_string(), manifest.python.clone()))
+    } else if let Some(fonts) = manifest.fonts.as_ref().filter(|a| a.size == size && a.sha256 == hash) {
+        Some(("fonts".to_string(), "all".to_string(), "完整浏览器字体包".to_string(), fonts.clone()))
+    } else {
+        manifest.font_packs.iter()
+            .find(|pack| pack.asset.size == size && pack.asset.sha256 == hash)
+            .map(|pack| ("font_pack".to_string(), pack.id.clone(), pack.name.clone(), pack.asset.clone()))
+    };
+    let Some((kind, id, name, asset)) = matched else {
+        return Err("文件大小或 SHA256 与当前版本清单不匹配，请确认下载的是本版本对应的压缩包".into());
+    };
+    let downloads = downloads_dir(root);
+    fs::create_dir_all(&downloads).map_err(|e| e.to_string())?;
+    let target = downloads.join(format!("{}.zip", asset.sha256));
+    if source.canonicalize().ok() != target.canonicalize().ok() {
+        fs::copy(&source, &target).map_err(|e| format!("复制离线包失败：{e}"))?;
+    }
+    Ok(serde_json::json!({ "kind": kind, "id": id, "name": name, "path": target.display().to_string() }))
+}
+/// Test whether a user-supplied HTTP/SOCKS5 proxy can reach GitHub Releases.
+pub fn test_proxy(proxy: &str) -> Result<serde_json::Value, String> {
+    let proxy = proxy.trim();
+    if proxy.is_empty() {
+        return Err("请先填写代理地址".into());
+    }
+    let parsed_proxy = reqwest::Proxy::all(proxy).map_err(|_| "代理地址格式无效，请使用 http:// 或 socks5:// 开头".to_string())?;
+    let started = std::time::Instant::now();
+    let result: Result<u16, String> = tauri::async_runtime::block_on(async {
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(8))
+            .timeout(Duration::from_secs(12))
+            .user_agent("Cacer-proxy-check")
+            .proxy(parsed_proxy)
+            .build()
+            .map_err(|e| format!("初始化代理失败：{e}"))?;
+        let response = client
+            .head("https://github.com/baseless1119/CacerBrowser/releases")
+            .send()
+            .await
+            .map_err(|e| {
+                let text = e.to_string();
+                if text.to_ascii_lowercase().contains("timed out") {
+                    "连接超时，请确认代理已开启且能访问 GitHub".to_string()
+                } else if text.contains("10061") || text.to_ascii_lowercase().contains("refused") {
+                    "无法连接到该代理端口（连接被拒绝），请检查端口号".to_string()
+                } else {
+                    format!("代理不可用：{text}")
+                }
+            })?;
+        let code = response.status().as_u16();
+        if code >= 500 {
+            return Err(format!("代理返回服务端错误（HTTP {code}）"));
+        }
+        Ok(code)
+    });
+    let status = result?;
+    Ok(serde_json::json!({
+        "ok": true,
+        "status": status,
+        "latency_ms": started.elapsed().as_millis() as u64,
+    }))
+}
 pub(crate) fn download(root: &Path, asset: &Asset, proxy: &str, name: &str) -> Result<PathBuf, String> {
+    // Check local cache first (both <sha256>.zip and manually placed original filename).
+    let downloads = downloads_dir(root);
+    let hashed = downloads.join(format!("{}.zip", asset.sha256));
+    if matches_asset(&hashed, asset)? {
+        return Ok(hashed);
+    }
+    if let Some(filename) = asset_filename(asset) {
+        let manual = downloads.join(filename);
+        if matches_asset(&manual, asset)? {
+            return Ok(manual);
+        }
+    }
     let settings = download_settings(root);
     let proxy = if proxy.trim().is_empty() { settings.proxy } else { proxy.to_string() };
-    let system = super::system_proxy().ok()
-        .filter(|system| system["enabled"].as_bool() == Some(true))
-        .and_then(|system| system["server"].as_str().and_then(windows_proxy));
+    let system = crate::task::system_proxy_url();
     let mut routes: Vec<(String, String, bool, String)> = Vec::new();
-    // Mirrors first: GitHub itself is often unreachable without a proxy.
-    for mirror in MIRRORS {
-        routes.push((format!("{mirror}/{}", asset.url), String::new(), true,
-            format!("镜像 {}", mirror.trim_start_matches("https://"))));
-    }
+    // Honor an explicit proxy first so users who configured one never stall on public mirrors.
     if !proxy.trim().is_empty() {
         routes.push((asset.url.clone(), proxy, false, "指定代理".into()));
     }
     if let Some(system) = system {
         routes.push((asset.url.clone(), system, false, "系统代理".into()));
     }
-    routes.push((asset.url.clone(), String::new(), false, "系统 / 环境代理".into()));
-    routes.push((asset.url.clone(), String::new(), true, "直连".into()));
+    for mirror in MIRRORS {
+        routes.push((format!("{mirror}/{}", asset.url), String::new(), true,
+            format!("镜像 {}", mirror.trim_start_matches("https://"))));
+    }
+    routes.push((asset.url.clone(), String::new(), false, "环境代理".into()));
+    routes.push((asset.url.clone(), String::new(), true, "GitHub 直连".into()));
+    let total_routes = routes.len();
     let mut last_error = String::new();
-    for (url, proxy, direct, route) in routes {
+    let mut not_found_count = 0usize;
+    for (idx, (url, proxy, direct, route)) in routes.into_iter().enumerate() {
         cancelled()?;
-        let label = format!("{name} · {route}");
-        progress(&label, 0, asset.size);
+        let is_github_origin = url == asset.url;
+        let label = format!("{name} · 线路 {}/{total_routes}（{route}）", idx + 1);
+        progress(&format!("{label} · 正在连接…"), 0, asset.size);
         match download_attempt(root, asset, &url, &proxy, direct, &label) {
             Ok(path) => return Ok(path),
             Err(error) => {
                 cancelled()?;
+                if error.starts_with("HTTP 404") {
+                    not_found_count += 1;
+                    // Stop immediately if GitHub itself or 2+ routes confirm 404:
+                    // no proxy can fix a missing remote asset.
+                    if is_github_origin || not_found_count >= 2 {
+                        return Err(format!(
+                            "远程资源不存在（HTTP 404）：{}。该版本的资源链接可能已失效，请升级到最新版本，或手动导入对应的离线压缩包。",
+                            asset.url
+                        ));
+                    }
+                }
                 last_error = format!("{route}：{error}");
             }
         }
@@ -659,50 +673,92 @@ fn download_attempt(root: &Path, asset: &Asset, request_url: &str, proxy: &str, 
         || !url.path().starts_with("/baseless1119/CacerBrowser/releases/download/") {
         return Err("运行时下载地址不属于项目 Release".into());
     }
-    let downloads = cache(root).join("downloads");
+    let downloads = downloads_dir(root);
     fs::create_dir_all(&downloads).map_err(|e| e.to_string())?;
     let target = downloads.join(format!("{}.zip", asset.sha256));
-    if target.is_file() && fs::metadata(&target).map_err(|e| e.to_string())?.len() == asset.size
-        && digest_file(&target)? == asset.sha256 {
+    if matches_asset(&target, asset)? {
         return Ok(target);
     }
     let partial = downloads.join(format!("{}.partial", asset.sha256));
-    let result = tauri::async_runtime::block_on(async {
-        let mut builder = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(20))
-            .read_timeout(Duration::from_secs(30))
-            .timeout(Duration::from_secs(7200))
-            .user_agent("Cacer-runtime");
-        if direct { builder = builder.no_proxy(); }
-        if !proxy.trim().is_empty() {
-            builder = builder.proxy(reqwest::Proxy::all(proxy.trim()).map_err(|e| e.to_string())?);
-        }
-        let client = builder.build().map_err(|e| e.to_string())?;
-        let mut response = client.get(request_url).send().await.and_then(|r| r.error_for_status()).map_err(|e| format!("下载失败：{e}"))?;
-        if let Some(length) = response.content_length() {
-            if length != asset.size { return Err("下载大小与清单不一致".into()); }
-        }
-        let mut output = File::create(&partial).map_err(|e| e.to_string())?;
-        let mut digest = Sha256::new();
-        let mut downloaded = 0;
-        progress(name, 0, asset.size);
-        loop {
-            cancelled()?;
-            let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? else { break; };
-            downloaded += chunk.len() as u64;
-            if downloaded > asset.size { return Err("下载内容超出预期大小".into()); }
-            output.write_all(&chunk).map_err(|e| e.to_string())?;
-            digest.update(&chunk);
-            progress(name, downloaded, asset.size);
-        }
-        if downloaded != asset.size || format!("{:x}", digest.finalize()) != asset.sha256 {
-            return Err("SHA256 校验失败，请重试".into());
-        }
-        drop(output);
-        if target.exists() { fs::remove_file(&target).map_err(|e| e.to_string())?; }
-        fs::rename(&partial, &target).map_err(|e| e.to_string())?;
-        Ok(target.clone())
+    let request_url = request_url.to_string();
+    let proxy = proxy.to_string();
+    let name = name.to_string();
+    let expected_size = asset.size;
+    let expected_sha = asset.sha256.clone();
+    let partial_worker = partial.clone();
+    let target_worker = target.clone();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<PathBuf, String>>();
+    // Spawn on the async runtime and poll cancellation on this thread so clicking
+    // cancel aborts in-flight TCP connects/reads immediately (< 100ms).
+    let handle = tauri::async_runtime::spawn(async move {
+        let outcome = async {
+            let mut builder = reqwest::Client::builder()
+                .connect_timeout(Duration::from_secs(8))
+                .read_timeout(Duration::from_secs(20))
+                .timeout(Duration::from_secs(7200))
+                .user_agent("Cacer-runtime");
+            if direct { builder = builder.no_proxy(); }
+            if !proxy.trim().is_empty() {
+                builder = builder.proxy(reqwest::Proxy::all(proxy.trim()).map_err(|e| e.to_string())?);
+            }
+            let client = builder.build().map_err(|e| e.to_string())?;
+            let response = client.get(&request_url).send().await
+                .map_err(|e| format!("下载失败：{e}"))?;
+            if response.status() == reqwest::StatusCode::NOT_FOUND {
+                return Err("HTTP 404 Not Found（资源不存在）".into());
+            }
+            let mut response = response.error_for_status()
+                .map_err(|e| format!("下载失败：{e}"))?;
+            if let Some(length) = response.content_length() {
+                if length != expected_size { return Err("下载大小与清单不一致".into()); }
+            }
+            let mut output = File::create(&partial_worker).map_err(|e| e.to_string())?;
+            let mut digest = Sha256::new();
+            let mut downloaded = 0u64;
+            let started = std::time::Instant::now();
+            progress(&name, 0, expected_size);
+            loop {
+                cancelled()?;
+                let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? else { break; };
+                downloaded += chunk.len() as u64;
+                if downloaded > expected_size { return Err("下载内容超出预期大小".into()); }
+                output.write_all(&chunk).map_err(|e| e.to_string())?;
+                digest.update(&chunk);
+                let elapsed = started.elapsed().as_secs_f64();
+                let status_label = if elapsed >= 0.4 {
+                    let speed = downloaded as f64 / elapsed;
+                    let speed_text = if speed >= 1024.0 * 1024.0 {
+                        format!("{:.1} MB/s", speed / 1024.0 / 1024.0)
+                    } else {
+                        format!("{:.0} KB/s", speed / 1024.0)
+                    };
+                    format!("{name} · {speed_text}")
+                } else {
+                    name.clone()
+                };
+                progress(&status_label, downloaded, expected_size);
+            }
+            if downloaded != expected_size || format!("{:x}", digest.finalize()) != expected_sha {
+                return Err("SHA256 校验失败，请重试".into());
+            }
+            drop(output);
+            if target_worker.exists() { fs::remove_file(&target_worker).map_err(|e| e.to_string())?; }
+            fs::rename(&partial_worker, &target_worker).map_err(|e| e.to_string())?;
+            Ok(target_worker)
+        }.await;
+        let _ = tx.send(outcome);
     });
+    let result = loop {
+        if TASK.is_cancelled() {
+            handle.abort();
+            break Err("已取消，可重新尝试".into());
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(outcome) => break outcome,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break Err("下载任务已中止".into()),
+        }
+    };
     if result.is_err() { let _ = fs::remove_file(&partial); }
     result
 }
@@ -974,5 +1030,54 @@ mod tests {
         assert!(is_resolution_error("ERROR: No matching distribution found for numpy==2.5.4"));
         assert!(is_resolution_error("ERROR: Package 'foo' requires a different Python: 3.11.0 not in '>=3.12' (Requires-Python)"));
         assert!(!is_resolution_error("ReadTimeoutError: HTTPSConnectionPool(host='pypi.org', port=443): Read timed out."));
+    }
+    #[test]
+    fn manual_named_archive_and_import_archive_reuse_verified_zips() {
+        let dir = TestDir::new();
+        fs::create_dir_all(dir.0.join("core")).unwrap();
+        fs::write(dir.0.join("core/cli.py"), "").unwrap();
+        let runtime_dir = dir.0.join("runtime");
+        fs::create_dir_all(runtime_dir.join("camoufox")).unwrap();
+        fs::write(runtime_dir.join("camoufox/camoufox.exe"), "engine").unwrap();
+        let zip = dir.0.join("fonts-hans.zip");
+        archive(&zip, "hans.ttf", b"font");
+        let hash = operation(|| digest_file(&zip)).unwrap();
+        let size = fs::metadata(&zip).unwrap().len();
+        let asset = Asset {
+            sha256: hash.clone(),
+            size,
+            unpacked_size: 4,
+            url: "https://github.com/baseless1119/CacerBrowser/releases/download/runtime-1/fonts-hans.zip".into(),
+        };
+        let manifest = serde_json::json!({
+            "schema": 2, "engine_id": "a".repeat(64), "python_version": "3.14",
+            "python": {"sha256": "b".repeat(64), "size": 1, "unpacked_size": 1,
+                "url": "https://github.com/baseless1119/CacerBrowser/releases/download/runtime-1/python-runtime.zip"},
+            "font_packs": [
+                {"id": "base", "name": "基础字体", "count": 1, "sha256": "c".repeat(64), "size": 1, "unpacked_size": 1,
+                    "url": "https://github.com/baseless1119/CacerBrowser/releases/download/runtime-1/fonts-base.zip"},
+                {"id": "hans", "name": "简体中文", "count": 1, "sha256": hash, "size": size, "unpacked_size": 4,
+                    "url": asset.url}
+            ],
+            "font_index": {"files": {}}
+        });
+        fs::write(runtime_dir.join("manifest.json"), manifest.to_string()).unwrap();
+
+        // Placing original filename in downloads_dir lets download() succeed offline.
+        let dl = downloads_dir(&dir.0);
+        fs::create_dir_all(&dl).unwrap();
+        fs::copy(&zip, dl.join("fonts-hans.zip")).unwrap();
+        let found = operation(|| download(&dir.0, &asset, "", "test")).unwrap();
+        assert_eq!(found, dl.join("fonts-hans.zip"));
+
+        // import_archive() identifies the pack by SHA256 and rejects mismatched files.
+        fs::remove_file(dl.join("fonts-hans.zip")).unwrap();
+        let imported = operation(|| import_archive(&dir.0, &zip.to_string_lossy())).unwrap();
+        assert_eq!(imported["id"], "hans");
+        assert!(dl.join(format!("{}.zip", asset.sha256)).is_file());
+
+        let bad_zip = dir.0.join("other.zip");
+        archive(&bad_zip, "bad.ttf", b"nope");
+        assert!(operation(|| import_archive(&dir.0, &bad_zip.to_string_lossy())).is_err());
     }
 }

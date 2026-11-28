@@ -1,12 +1,13 @@
 //! Check GitHub for a newer Cacer build and fetch its installer through
 //! mirrors that stay reachable from mainland China.
+use crate::task::{self, TaskControl, TaskStatus};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{atomic::{AtomicBool, Ordering}, Mutex};
+use std::sync::Mutex;
 use std::time::Duration;
 
 const REPO: &str = "baseless1119/CacerBrowser";
@@ -24,30 +25,18 @@ pub struct UpdateInfo {
     pub available: bool,
 }
 
-#[derive(Clone, Default, Serialize)]
-pub struct Status {
-    pub busy: bool,
-    pub message: String,
-    pub downloaded: u64,
-    pub total: u64,
-}
+pub type Status = TaskStatus;
 
-static STATUS: Mutex<Status> = Mutex::new(Status {
-    busy: false, message: String::new(), downloaded: 0, total: 0,
-});
-static CANCEL: AtomicBool = AtomicBool::new(false);
+static TASK: TaskControl = TaskControl::new();
 static RELEASE: Mutex<Option<UpdateInfo>> = Mutex::new(None);
 // Keep the verified metadata with the file even if a later update check runs.
 static DOWNLOADED: Mutex<Option<(PathBuf, UpdateInfo)>> = Mutex::new(None);
 
-pub fn status() -> Status { STATUS.lock().unwrap().clone() }
-pub fn cancel() { CANCEL.store(true, Ordering::Relaxed); }
+pub fn status() -> Status { TASK.status() }
+pub fn cancel() { TASK.cancel(); }
 
 fn progress(message: &str, downloaded: u64, total: u64) {
-    let mut state = STATUS.lock().unwrap();
-    state.message = message.into();
-    state.downloaded = downloaded;
-    state.total = total;
+    TASK.progress(message, downloaded, total);
 }
 
 fn updates_dir(root: &Path) -> PathBuf {
@@ -64,12 +53,6 @@ fn client(proxy: &str, direct: bool, timeout: u64) -> Result<reqwest::Client, St
         builder = builder.proxy(reqwest::Proxy::all(proxy.trim()).map_err(|e| e.to_string())?);
     }
     builder.build().map_err(|e| e.to_string())
-}
-
-fn system_proxy() -> Option<String> {
-    let value = super::system_proxy().ok()?;
-    if value["enabled"].as_bool() != Some(true) { return None; }
-    value["server"].as_str().and_then(super::runtime::windows_proxy)
 }
 
 fn release_digest(asset: &serde_json::Value) -> Result<String, String> {
@@ -132,7 +115,7 @@ pub fn check(root: &Path) -> Result<UpdateInfo, String> {
     let settings = super::runtime::download_settings(root);
     let mut attempts = vec![(String::new(), false), (String::new(), true)];
     if !settings.proxy.trim().is_empty() { attempts.push((settings.proxy, false)); }
-    if let Some(proxy) = system_proxy() { attempts.push((proxy, false)); }
+    if let Some(proxy) = task::system_proxy_url() { attempts.push((proxy, false)); }
     let mut last_error = String::new();
     for (attempt_proxy, direct) in attempts {
         let Ok(client) = client(&attempt_proxy, direct, 20) else { continue };
@@ -198,19 +181,10 @@ fn verify_installer(path: &Path, size: u64, expected: &str) -> Result<(), String
 pub fn download(root: &Path) -> Result<String, String> {
     let info = RELEASE.lock().unwrap().clone().ok_or("请先检查更新")?;
     if !info.available { return Err("当前已是最新版本".into()); }
-    {
-        let mut state = STATUS.lock().unwrap();
-        if state.busy { return Err("更新下载正在进行".into()); }
-        CANCEL.store(false, Ordering::Relaxed);
-        *state = Status { busy: true, message: "正在准备下载".into(), downloaded: 0, total: info.size };
-    }
     *DOWNLOADED.lock().unwrap() = None;
-    let result = fetch(root, &info);
-    {
-        let mut state = STATUS.lock().unwrap();
-        state.busy = false;
-        state.message = match &result { Ok(_) => "更新包下载完成".into(), Err(error) => error.clone() };
-    }
+    let result = TASK.run("更新下载正在进行", "正在准备下载", info.size, "更新包下载完成", || {
+        fetch(root, &info)
+    });
     if let Ok(path) = &result { *DOWNLOADED.lock().unwrap() = Some((PathBuf::from(path), info)); }
     result
 }
@@ -224,27 +198,27 @@ fn fetch(root: &Path, info: &UpdateInfo) -> Result<String, String> {
     }
     let settings = super::runtime::download_settings(root);
     let mut routes: Vec<(String, String, bool, String)> = Vec::new();
-    for mirror in super::runtime::MIRRORS {
-        let host = mirror.trim_start_matches("https://");
-        routes.push((format!("{mirror}/{}", info.url), String::new(), true, format!("镜像 {host}")));
-    }
     if !settings.proxy.trim().is_empty() {
         routes.push((info.url.clone(), settings.proxy.clone(), false, "GitHub · 指定代理".into()));
     }
-    if let Some(proxy) = system_proxy() {
+    if let Some(proxy) = task::system_proxy_url() {
         routes.push((info.url.clone(), proxy, false, "GitHub · 系统代理".into()));
+    }
+    for mirror in task::MIRRORS {
+        let host = mirror.trim_start_matches("https://");
+        routes.push((format!("{mirror}/{}", info.url), String::new(), true, format!("镜像 {host}")));
     }
     routes.push((info.url.clone(), String::new(), false, "GitHub".into()));
     routes.push((info.url.clone(), String::new(), true, "GitHub 直连".into()));
     let mut last_error = String::new();
     for (url, proxy, direct, route) in routes {
-        if CANCEL.load(Ordering::Relaxed) { return Err("已取消下载".into()); }
+        TASK.cancelled("已取消下载")?;
         let label = format!("正在下载 Cacer {} · {route}", info.latest);
         progress(&label, 0, info.size);
         match attempt(&target, &url, &proxy, direct, info.size, &info.sha256, &label) {
             Ok(()) => return Ok(target.to_string_lossy().into_owned()),
             Err(error) => {
-                if CANCEL.load(Ordering::Relaxed) { return Err("已取消下载".into()); }
+                TASK.cancelled("已取消下载")?;
                 last_error = format!("{route}：{error}");
             }
         }
@@ -255,41 +229,61 @@ fn fetch(root: &Path, info: &UpdateInfo) -> Result<String, String> {
 fn attempt(target: &Path, url: &str, proxy: &str, direct: bool, size: u64, expected: &str, label: &str) -> Result<(), String> {
     let client = client(proxy, direct, 3600)?;
     let partial = target.with_extension("partial");
-    let result = tauri::async_runtime::block_on(async {
-        let mut response = client.get(url).send().await
-            .and_then(|response| response.error_for_status())
-            .map_err(|e| format!("连接失败：{e}"))?;
-        if let Some(length) = response.content_length() {
-            if size > 0 && length != size {
-                return Err(format!("安装包大小不一致（{length} / {size}）"));
+    let url = url.to_string();
+    let expected = expected.to_string();
+    let label = label.to_string();
+    let partial_worker = partial.clone();
+    let target_worker = target.to_path_buf();
+    let (tx, rx) = std::sync::mpsc::channel::<Result<(), String>>();
+    let handle = tauri::async_runtime::spawn(async move {
+        let outcome = async {
+            let mut response = client.get(&url).send().await
+                .and_then(|response| response.error_for_status())
+                .map_err(|e| format!("连接失败：{e}"))?;
+            if let Some(length) = response.content_length() {
+                if size > 0 && length != size {
+                    return Err(format!("安装包大小不一致（{length} / {size}）"));
+                }
             }
-        }
-        let mut file = File::create(&partial).map_err(|e| e.to_string())?;
-        let mut magic = Vec::new();
-        let mut digest = Sha256::new();
-        let mut downloaded = 0u64;
-        loop {
-            if CANCEL.load(Ordering::Relaxed) { return Err("已取消下载".into()); }
-            let Some(chunk) = response.chunk().await.map_err(|e| format!("下载中断：{e}"))? else { break };
-            if magic.len() < 2 {
-                let take = (2 - magic.len()).min(chunk.len());
-                magic.extend_from_slice(&chunk[..take]);
+            let mut file = File::create(&partial_worker).map_err(|e| e.to_string())?;
+            let mut magic = Vec::new();
+            let mut digest = Sha256::new();
+            let mut downloaded = 0u64;
+            loop {
+                TASK.cancelled("已取消下载")?;
+                let Some(chunk) = response.chunk().await.map_err(|e| format!("下载中断：{e}"))? else { break };
+                if magic.len() < 2 {
+                    let take = (2 - magic.len()).min(chunk.len());
+                    magic.extend_from_slice(&chunk[..take]);
+                }
+                downloaded += chunk.len() as u64;
+                if size > 0 && downloaded > size { return Err("下载内容超出预期大小".into()); }
+                digest.update(&chunk);
+                file.write_all(&chunk).map_err(|e| e.to_string())?;
+                progress(&label, downloaded, size);
             }
-            downloaded += chunk.len() as u64;
-            if size > 0 && downloaded > size { return Err("下载内容超出预期大小".into()); }
-            digest.update(&chunk);
-            file.write_all(&chunk).map_err(|e| e.to_string())?;
-            progress(label, downloaded, size);
-        }
-        if size > 0 && downloaded != size { return Err("安装包不完整".into()); }
-        if magic.as_slice() != b"MZ" { return Err("下载内容不是有效的安装程序".into()); }
-        if format!("{:x}", digest.finalize()) != expected {
-            return Err("更新包 SHA256 校验失败".into());
-        }
-        drop(file);
-        if target.exists() { fs::remove_file(target).map_err(|e| e.to_string())?; }
-        fs::rename(&partial, target).map_err(|e| e.to_string())
+            if size > 0 && downloaded != size { return Err("安装包不完整".into()); }
+            if magic.as_slice() != b"MZ" { return Err("下载内容不是有效的安装程序".into()); }
+            if format!("{:x}", digest.finalize()) != expected {
+                return Err("更新包 SHA256 校验失败".into());
+            }
+            drop(file);
+            if target_worker.exists() { fs::remove_file(&target_worker).map_err(|e| e.to_string())?; }
+            fs::rename(&partial_worker, &target_worker).map_err(|e| e.to_string())
+        }.await;
+        let _ = tx.send(outcome);
     });
+    let result = loop {
+        if TASK.is_cancelled() {
+            handle.abort();
+            break Err("已取消下载".into());
+        }
+        match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(outcome) => break outcome,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break Err("下载任务已中止".into()),
+        }
+    };
     if result.is_err() { let _ = fs::remove_file(&partial); }
     result
 }

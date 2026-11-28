@@ -510,6 +510,16 @@ def _load_identities(profiles_dir: Path) -> List[Identity]:
     return out
 
 
+def _emit(payload: Any) -> int:
+    print(json.dumps(payload, ensure_ascii=False))
+    return 0
+
+
+def _fail(message: str) -> int:
+    print(json.dumps({"error": message}, ensure_ascii=False))
+    return 1
+
+
 def cmd_list(args):
     profiles_dir = Path(args.profiles)
     snapshot = _process_snapshot()
@@ -517,8 +527,7 @@ def cmd_list(args):
     for ident in _load_identities(profiles_dir):
         result.append(_identity_summary(
             ident, runtime_state(profiles_dir, ident.id, snapshot)))
-    print(json.dumps(result, ensure_ascii=False))
-    return 0
+    return _emit(result)
 
 
 def cmd_create(args):
@@ -536,19 +545,16 @@ def cmd_create(args):
     with _mutation_lock(Path(args.profiles)):
         ident.sort_order = next_sort_order(Path(args.profiles))
         ident.save(Path(args.profiles))
-    print(json.dumps(_identity_summary(ident, None), ensure_ascii=False))
-    return 0
+    return _emit(_identity_summary(ident, None))
 
 
 def cmd_clone(args):
     profiles_dir = Path(args.profiles)
     if runtime_state(profiles_dir, args.id):
-        print(json.dumps({"error": "identity is running; stop it first"}, ensure_ascii=False))
-        return 1
+        return _fail("环境正在运行中，请先停止后再复制")
     source_file = profiles_dir / args.id / "identity.json"
     if not source_file.is_file():
-        print(json.dumps({"error": f"no such identity {args.id}"}, ensure_ascii=False))
-        return 1
+        return _fail(f"找不到环境：{args.id}")
     source = Identity.load(source_file)
     clone = create_identity(
         args.name,
@@ -567,20 +573,17 @@ def cmd_clone(args):
     with _mutation_lock(profiles_dir):
         clone.sort_order = next_sort_order(profiles_dir)
         clone.save(profiles_dir)
-    print(json.dumps(_identity_summary(clone, None), ensure_ascii=False))
-    return 0
+    return _emit(_identity_summary(clone, None))
 
 
 def cmd_export(args):
     profiles_dir = Path(args.profiles)
     if runtime_state(profiles_dir, args.id):
-        print(json.dumps({"error": "identity is running; stop it before export"}, ensure_ascii=False))
-        return 1
+        return _fail("环境正在运行中，请先停止后再导出")
     source = profiles_dir / args.id
     identity_file = source / "identity.json"
     if not identity_file.is_file():
-        print(json.dumps({"error": f"no such identity {args.id}"}, ensure_ascii=False))
-        return 1
+        return _fail(f"找不到环境：{args.id}")
     destination = Path(args.archive).expanduser()
     destination.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(destination, "w", zipfile.ZIP_DEFLATED) as archive:
@@ -601,8 +604,7 @@ def cmd_export(args):
                 if file.name in _SKIP_FILES:
                     continue
                 archive.write(file, Path("profile") / relative)
-    print(json.dumps({"archive": str(destination), "id": args.id}, ensure_ascii=False))
-    return 0
+    return _emit({"archive": str(destination), "id": args.id})
 
 
 # Volatile files never belong in a migration archive: runtime.json would make
@@ -791,8 +793,7 @@ def cmd_cookies(args):
     profiles_dir = Path(args.profiles)
     database = profiles_dir / args.id / "profile" / "cookies.sqlite"
     if not database.is_file():
-        print(json.dumps({"error": f"no cookies database for {args.id}"}, ensure_ascii=False))
-        return 1
+        return _fail("该环境暂无 Cookie 记录（请先启动浏览器访问网站）")
     destination = Path(args.output).expanduser()
     destination.parent.mkdir(parents=True, exist_ok=True)
     same_site = {0: "None", 1: "Lax", 2: "Strict"}
@@ -825,27 +826,21 @@ def cmd_cookies(args):
         for name, value, host, path, expiry, secure, http_only, site in rows
     ]
     destination.write_text(json.dumps(cookies, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(
-        {"archive": str(destination), "id": args.id, "count": len(cookies)},
-        ensure_ascii=False))
-    return 0
+    return _emit({"archive": str(destination), "id": args.id, "count": len(cookies)})
 
 
 def cmd_import(args):
     profiles_dir = Path(args.profiles)
     archive_path = Path(args.archive).expanduser()
     if not archive_path.is_file():
-        print(json.dumps({"error": f"archive not found: {archive_path}"}, ensure_ascii=False))
-        return 1
+        return _fail(f"找不到身份包：{archive_path}")
     with zipfile.ZipFile(archive_path) as archive:
         names = set(archive.namelist())
         if "identity.json" not in names:
-            print(json.dumps({"error": "invalid ShadowFox archive: identity.json missing"}, ensure_ascii=False))
-            return 1
+            return _fail("无效的身份包：缺少 identity.json")
         for name in names:
             if name.startswith("/") or ".." in Path(name).parts:
-                print(json.dumps({"error": "invalid archive path"}, ensure_ascii=False))
-                return 1
+                return _fail("身份包包含非法路径")
         imported = Identity.from_dict(json.loads(archive.read("identity.json")))
         target_id = imported.id
         if (profiles_dir / target_id / "identity.json").exists():
@@ -864,8 +859,7 @@ def cmd_import(args):
                 out = target / name
                 out.parent.mkdir(parents=True, exist_ok=True)
                 out.write_bytes(archive.read(name))
-    print(json.dumps(_identity_summary(imported, None), ensure_ascii=False))
-    return 0
+    return _emit(_identity_summary(imported, None))
 
 
 def cmd_rebuild(args):
@@ -935,12 +929,10 @@ def _prune_backups(backups: Path, identity_id: str, keep: int = 3) -> None:
 def cmd_delete(args):
     profiles_dir = Path(args.profiles)
     if runtime_state(profiles_dir, args.id):
-        print(json.dumps({"error": "identity is running; stop it first"}, ensure_ascii=False))
-        return 1
+        return _fail("环境正在运行中，请先停止后再删除")
     d = profiles_dir / args.id
     if not (d / "identity.json").is_file():
-        print(json.dumps({"error": f"no such identity {args.id}"}, ensure_ascii=False))
-        return 1
+        return _fail(f"找不到环境：{args.id}")
     if args.purge_profile:
         shutil.rmtree(d)
         # Rebuild snapshots are keyed by identity id; leaving them behind would
@@ -949,19 +941,17 @@ def cmd_delete(args):
         if backups.is_dir():
             for stale in backups.glob(f"{args.id}-*"):
                 shutil.rmtree(stale, ignore_errors=True)
-        print(json.dumps({"deleted": args.id, "purged": True}, ensure_ascii=False))
+        return _emit({"deleted": args.id, "purged": True})
     else:
         (d / "identity.json").unlink()
-        print(json.dumps({"deleted": args.id, "purged": False}, ensure_ascii=False))
-    return 0
+        return _emit({"deleted": args.id, "purged": False})
 
 
 def cmd_edit(args):
     profiles_dir = Path(args.profiles)
     ident_file = profiles_dir / args.id / "identity.json"
     if not ident_file.is_file():
-        print(json.dumps({"error": f"no such identity {args.id}"}, ensure_ascii=False))
-        return 1
+        return _fail(f"找不到环境：{args.id}")
     if runtime_state(profiles_dir, args.id) and any((
         args.network is not None,
         args.proxy_server is not None,
@@ -969,14 +959,7 @@ def cmd_edit(args):
         args.proxy_node is not None,
         args.clear_proxy,
     )):
-        # Name/note/UI language/memory cache/extension switches are written to
-        # identity.json and are safe to change under a live browser (they take
-        # effect on the next launch). Routing changes would leave the running
-        # helper on stale settings, so they still require a stop.
-        print(json.dumps({
-            "error": "浏览器运行中只能修改名称、备注、界面语言、内存缓存和扩展开关；网络与代理设置请先停止浏览器",
-        }, ensure_ascii=False))
-        return 1
+        return _fail("浏览器运行中只能修改名称、备注、界面语言、内存缓存和扩展开关；网络与代理设置请先停止浏览器")
     ident = Identity.load(ident_file)
     ident.update_meta(
         name=args.name, note=args.note, network_mode=args.network,
@@ -992,8 +975,7 @@ def cmd_edit(args):
         ),
         profiles_dir=profiles_dir,
     )
-    print(json.dumps(_identity_summary(ident, None), ensure_ascii=False))
-    return 0
+    return _emit(_identity_summary(ident, None))
 
 
 def cmd_reorder(args):
@@ -1001,15 +983,13 @@ def cmd_reorder(args):
     profiles_dir = Path(args.profiles)
     requested = [x.strip() for x in (args.ids or "").split(",") if x.strip()]
     if not requested:
-        print(json.dumps({"error": "ids must not be empty"}, ensure_ascii=False))
-        return 1
+        return _fail("排序列表不能为空")
     existing = _load_identities(profiles_dir)
     by_id = {ident.id: ident for ident in existing}
     requested = list(dict.fromkeys(requested))
     unknown = [ident_id for ident_id in requested if ident_id not in by_id]
     if unknown:
-        print(json.dumps({"error": f"no such identity {unknown[0]}"}, ensure_ascii=False))
-        return 1
+        return _fail(f"找不到环境：{unknown[0]}")
     # Any identity the caller did not mention keeps its relative position after
     # the explicitly ordered ones.
     ordered = requested + [ident.id for ident in existing if ident.id not in requested]
@@ -1018,64 +998,54 @@ def cmd_reorder(args):
         if ident.sort_order != index:
             ident.sort_order = index
             ident.save(profiles_dir)
-    print(json.dumps({"order": ordered}, ensure_ascii=False))
-    return 0
+    return _emit({"order": ordered})
 
 
 def cmd_font_requirements(args):
     """Resolve the engine's final font draw without starting a browser."""
     if not args.id or not all(char.isascii() and (char.isalnum() or char in "-_") for char in args.id):
-        raise ValueError("invalid identity id")
+        raise ValueError("无效环境 ID")
     identity = Identity.load(Path(args.profiles) / args.id / "identity.json")
     from .launcher import required_font_families
-    print(json.dumps({"fonts": required_font_families(identity),
-                      "country": identity.geo.country,
-                      "languages": identity.geo.languages,
-                      "locale": identity.geo.locale,
-                      "ui_locale": identity.launcher.ui_locale}, ensure_ascii=False))
+    return _emit({"fonts": required_font_families(identity),
+                  "country": identity.geo.country,
+                  "languages": identity.geo.languages,
+                  "locale": identity.geo.locale,
+                  "ui_locale": identity.launcher.ui_locale})
 
 
 def cmd_launch(args):
     profiles_dir = Path(args.profiles).resolve()
     if runtime_state(profiles_dir, args.id):
-        print(json.dumps({"error": "already running"}, ensure_ascii=False))
-        return 1
+        return _fail("该环境已在运行中")
     ident_file = profiles_dir / args.id / "identity.json"
     if not ident_file.is_file():
-        print(json.dumps({"error": f"no such identity {args.id}"}, ensure_ascii=False))
-        return 1
+        return _fail(f"找不到环境：{args.id}")
 
     _reap_orphan_browsers(profiles_dir, args.id)
 
-    # Detached helper owns the browser; we only supervise it via runtime.json.
-    # Its output goes to a per-identity helper.log so failures are inspectable.
+    # Detached helper owns the browser; overwrite helper.log on each fresh
+    # launch so logs stay bounded and parent does not leak the handle.
     log_path = profiles_dir / args.id / "helper.log"
-    log_file = open(log_path, "ab")
     creationflags = 0
     if os.name == "nt":
-        # The GUI launches a console Python executable. CREATE_NO_WINDOW is
-        # the Windows-native way to prevent a helper console from flashing;
-        # combining it with DETACHED_PROCESS can still produce a black window
-        # on some Windows builds.
         creationflags = subprocess.CREATE_NO_WINDOW
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     helper_python = sys.executable
     if os.name == "nt":
-        # python.exe is a console subsystem executable. Use pythonw.exe for
-        # the detached browser owner so descendants (Camoufox/Node) inherit a
-        # truly windowless process tree instead of briefly flashing a console.
         pythonw = Path(sys.executable).with_name("pythonw.exe")
         if pythonw.is_file():
             helper_python = str(pythonw)
-    proc = subprocess.Popen(
-        [helper_python, str(Path(__file__).with_name("bootstrap.py")),
-         "--profiles", str(profiles_dir),
-         "_run", args.id],
-        creationflags=creationflags,
-        cwd=str(Path(__file__).resolve().parent.parent),
-        env=env,
-        stdout=log_file, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-    )
+    with open(log_path, "wb") as log_file:
+        proc = subprocess.Popen(
+            [helper_python, str(Path(__file__).with_name("bootstrap.py")),
+             "--profiles", str(profiles_dir),
+             "_run", args.id],
+            creationflags=creationflags,
+            cwd=str(Path(__file__).resolve().parent.parent),
+            env=env,
+            stdout=log_file, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+        )
 
     # Wait for the helper to either publish runtime.json or die.
     deadline = time.time() + 60
@@ -1085,51 +1055,54 @@ def cmd_launch(args):
             detail = _tail_log(log_path)
             message = "浏览器启动失败"
             if detail:
-                message += f": {detail[-1200:]}"
-            print(json.dumps({"error": message}, ensure_ascii=False))
-            return 1
-        # The GUI can opt into a responsive fire-and-forget launch. The
-        # helper remains supervised by runtime.json and the UI polling loop.
+                message += f"：{detail[-1200:]}"
+            return _fail(message)
         if state and args.no_wait:
             record_history(profiles_dir, args.id, "launch")
-            print(json.dumps(state, ensure_ascii=False))
-            return 0
-        # runtime.json is published while the browser is still initializing.
-        # Do not report success until Camoufox has entered its context.
+            return _emit(state)
         if state and state.get("status") == "running":
             record_history(profiles_dir, args.id, "launch")
-            print(json.dumps(state, ensure_ascii=False))
-            return 0
+            return _emit(state)
         time.sleep(0.5)
     detail = _tail_log(log_path)
     message = "浏览器启动超时（60 秒）"
     if detail:
-        message += f": {detail[-1200:]}"
-    print(json.dumps({"error": message}, ensure_ascii=False))
-    return 1
+        message += f"：{detail[-1200:]}"
+    return _fail(message)
 
 
-def cmd_stop(args):
-    profiles_dir = Path(args.profiles)
-    state = runtime_state(profiles_dir, args.id)
-    if not state:
-        print(json.dumps({"error": "not running"}, ensure_ascii=False))
-        return 1
+def _stop_one(profiles_dir: Path, identity_id: str, state: Dict[str, Any]) -> Dict[str, Any]:
     pid = int(state["pid"])
     ok = _kill_tree(pid, {int(state.get("mihomo_pid") or 0)})
     for _ in range(20):
         if not _pid_alive(pid):
             break
         time.sleep(0.25)
-    # The helper also releases its listener on exit; this covers the case
-    # where the tree kill took the helper down before its finally block ran.
-    _release_proxy(profiles_dir, args.id, state)
-    path = _runtime_path(profiles_dir, args.id)
+    _release_proxy(profiles_dir, identity_id, state)
+    path = _runtime_path(profiles_dir, identity_id)
     if path.exists():
         path.unlink()
-    record_history(profiles_dir, args.id, "stop")
-    print(json.dumps({"stopped": args.id, "pid": pid, "killed": ok}, ensure_ascii=False))
-    return 0
+    record_history(profiles_dir, identity_id, "stop")
+    return {"stopped": identity_id, "pid": pid, "killed": ok}
+
+
+def cmd_stop(args):
+    profiles_dir = Path(args.profiles)
+    state = runtime_state(profiles_dir, args.id)
+    if not state:
+        return _fail("该环境当前未在运行")
+    return _emit(_stop_one(profiles_dir, args.id, state))
+
+
+def cmd_stop_all(args):
+    profiles_dir = Path(args.profiles)
+    snapshot = _process_snapshot()
+    stopped = []
+    for identity_id in _running_ids(profiles_dir):
+        state = runtime_state(profiles_dir, identity_id, snapshot)
+        if state:
+            stopped.append(_stop_one(profiles_dir, identity_id, state))
+    return _emit({"stopped": stopped, "count": len(stopped)})
 
 
 def cmd_status(args):
@@ -1508,6 +1481,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--no-wait", action="store_true",
                    help="return after helper initialization; browser continues starting")
 
+    sub.add_parser("stop-all")
     p = sub.add_parser("stop")
     p.add_argument("id")
 
@@ -1552,7 +1526,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     handlers = {
         "list": cmd_list, "create": cmd_create, "clone": cmd_clone, "export": cmd_export, "cookies": cmd_cookies, "import": cmd_import, "rebuild": cmd_rebuild, "delete": cmd_delete,
         "export-all": cmd_export_all, "import-all": cmd_import_all,
-        "edit": cmd_edit, "launch": cmd_launch, "stop": cmd_stop,
+        "edit": cmd_edit, "launch": cmd_launch, "stop": cmd_stop, "stop-all": cmd_stop_all,
         "font-requirements": cmd_font_requirements,
         "reorder": cmd_reorder,
         "status": cmd_status, "_run": cmd_run,
@@ -1572,7 +1546,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # when committing. Other mutations retain the full-command lock.
     mutating = {
         "delete", "edit", "reorder",
-        "launch", "stop", "import", "import-all",
+        "launch", "stop", "stop-all", "import", "import-all",
         "proxy-rename", "proxy-delete", "proxy-set-core",
         "ext-remove",
     }
@@ -1582,8 +1556,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 return handlers[args.cmd](args)
         return handlers[args.cmd](args)
     except Exception as e:  # noqa: BLE001 -- CLI boundary
-        print(json.dumps({"error": f"{type(e).__name__}: {e}"}, ensure_ascii=False))
-        return 1
+        return _fail(str(e) or type(e).__name__)
 
 
 if __name__ == "__main__":

@@ -94,12 +94,20 @@ export async function installRuntime(kind: "python" | "fonts", proxy: string, fo
 export interface DownloadSettings { proxy: string; mirror: string }
 export const downloadSettings = () => invoke<DownloadSettings>("download_settings");
 export const saveDownloadSettings = (settings: DownloadSettings) => invoke<void>("save_download_settings", { settings });
+export const testDownloadProxy = (proxy: string) =>
+  invoke<{ ok: boolean; status: number; latency_ms: number }>("test_download_proxy", { proxy });
+export const importRuntimeArchive = (path: string) =>
+  invoke<{ kind: string; id: string; name: string; path: string }>("import_runtime_archive", { path });
+export const openRuntimeDownloadsDir = () =>
+  invoke<{ dir: string }>("open_runtime_downloads_dir");
 export interface FontPack {
   id: string; name: string; count: number; size: number; unpacked_size: number;
+  url?: string; file?: string; sha256?: string;
   cached: boolean; required: boolean;
 }
 export interface FontOverview {
   development: boolean; ready: boolean; packs: FontPack[]; missing_size: number;
+  downloads_dir?: string;
 }
 export const fontOverview = (identityId?: string, country?: string) =>
   invoke<FontOverview>("font_overview", { identityId: identityId || null, country: country || null });
@@ -254,6 +262,10 @@ export async function launchIdentity(id: string): Promise<void> {
 
 export async function stopIdentity(id: string): Promise<void> {
   await invoke("stop_identity", { id });
+}
+
+export async function stopAllIdentities(): Promise<{ count: number }> {
+  return await invoke<{ count: number }>("stop_all_identities");
 }
 
 export async function systemProxy(): Promise<SystemProxy> {

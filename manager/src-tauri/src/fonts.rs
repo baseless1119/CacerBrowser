@@ -63,14 +63,19 @@ fn pack_ready(root: &Path, manifest: &Manifest, id: &str, hash: &str) -> bool {
 pub fn overview(root: &Path, request: &Value) -> Result<Value, String> {
     let manifest = match runtime::manifest(root) {
         Ok(manifest) => manifest,
-        Err(_) => return Ok(json!({"development": true, "packs": [], "missing_size": 0, "ready": true})),
+        Err(_) => return Ok(json!({"development": true, "packs": [], "missing_size": 0, "ready": true, "downloads_dir": runtime::downloads_dir(root).display().to_string()})),
     };
+    let downloads_dir = runtime::downloads_dir(root).display().to_string();
     if let Some(asset) = &manifest.fonts {
         let cached = runtime::prepared_engine(root).is_some();
+        let file = asset.url.rsplit('/').next().unwrap_or("fonts.zip");
         return Ok(json!({"development": false, "ready": cached,
+            "downloads_dir": downloads_dir,
             "missing_size": if cached { 0 } else { asset.size },
             "packs": [{"id": "all", "name": "完整字体（旧版清单）", "count": 0,
-                "size": asset.size, "unpacked_size": asset.unpacked_size, "cached": cached, "required": true}]}));
+                "size": asset.size, "unpacked_size": asset.unpacked_size,
+                "url": asset.url, "file": file, "sha256": asset.sha256,
+                "cached": cached, "required": true}]}));
     }
     let required = required(&manifest, request);
     let mut missing_size = 0u64;
@@ -79,11 +84,13 @@ pub fn overview(root: &Path, request: &Value) -> Result<Value, String> {
         let cached = pack_ready(root, &manifest, &pack.id, &pack.asset.sha256);
         let needed = required.contains(&pack.id);
         if needed && !cached { missing_size += pack.asset.size; ready = false; }
+        let file = pack.asset.url.rsplit('/').next().unwrap_or("fonts.zip");
         json!({"id": pack.id, "name": pack.name, "count": pack.count,
             "size": pack.asset.size, "unpacked_size": pack.asset.unpacked_size,
+            "url": pack.asset.url, "file": file, "sha256": pack.asset.sha256,
             "cached": cached, "required": needed})
     }).collect::<Vec<_>>();
-    Ok(json!({"development": false, "packs": packs, "missing_size": missing_size, "ready": ready}))
+    Ok(json!({"development": false, "packs": packs, "missing_size": missing_size, "ready": ready, "downloads_dir": downloads_dir}))
 }
 
 fn ensure_engine(root: &Path, manifest: &Manifest) -> Result<PathBuf, String> {

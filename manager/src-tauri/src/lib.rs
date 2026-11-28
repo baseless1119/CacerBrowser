@@ -1,6 +1,8 @@
 mod runtime;
 mod fonts;
+mod task;
 mod update;
+mod win_dialog;
 
 use serde_json::Value;
 use std::io::Read;
@@ -423,12 +425,19 @@ fn code_root(root: &PathBuf) -> PathBuf {
 
 /// User-owned data lives in one portable `data` folder so the whole
 /// directory can be copied to migrate to another machine. Development runs
-/// keep it under the repo; packaged builds use LocalAppData.
+/// keep it under the repo; packaged builds use `%LOCALAPPDATA%\Cacer`
+/// (automatically migrating an existing legacy `ShadowFox` folder once).
 fn storage_root(root: &PathBuf) -> PathBuf {
     let base = if has_runtime_layout(root) && root.join("core").join("cli.py").is_file() {
         root.clone()
     } else if let Ok(local_app_data) = std::env::var("LOCALAPPDATA") {
-        PathBuf::from(local_app_data).join("ShadowFox")
+        let local = PathBuf::from(local_app_data);
+        let cacer = local.join("Cacer");
+        let legacy = local.join("ShadowFox");
+        if !cacer.exists() && legacy.is_dir() {
+            let _ = std::fs::rename(&legacy, &cacer);
+        }
+        if cacer.exists() || !legacy.is_dir() { cacer } else { legacy }
     } else {
         root.clone()
     };
@@ -463,11 +472,42 @@ fn cli_timeout(args: &[&str]) -> Duration {
     match args.first().copied().unwrap_or("") {
         "list" | "status" | "history" | "proxy-sources" | "proxy-nodes"
         | "proxy-discover" | "ext-list" => Duration::from_secs(30),
-        "launch" | "stop" | "cookies" => Duration::from_secs(120),
+        "launch" | "stop" | "stop-all" | "cookies" => Duration::from_secs(120),
         "create" | "clone" | "rebuild" | "ext-install" | "ext-import"
         | "proxy-import" => Duration::from_secs(300),
         "export" | "export-all" | "import" | "import-all" => Duration::from_secs(900),
         _ => Duration::from_secs(180),
+    }
+}
+
+/// Extract a clean human-readable message from CLI stdout/stderr:
+/// parse `{"error": "..."}` JSON payloads instead of surfacing raw JSON to users.
+fn extract_cli_error(stdout: &str, stderr: &str) -> String {
+    if let Ok(Value::Object(map)) = serde_json::from_str::<Value>(stdout.trim()) {
+        if let Some(err) = map.get("error").and_then(Value::as_str) {
+            let trimmed = err.trim();
+            if !trimmed.is_empty() {
+                return trimmed.to_string();
+            }
+        }
+    }
+    let detail = if stdout.is_empty() {
+        stderr.trim().to_string()
+    } else if stderr.is_empty() {
+        stdout.trim().to_string()
+    } else {
+        format!("{}\n{}", stdout.trim(), stderr.trim())
+    };
+    if detail.contains("could not draw a coherent identity") {
+        "暂时没有生成符合条件的指纹，请稍后重试".to_string()
+    } else if detail.contains("proxy mode requires") {
+        "代理模式需要选择节点或填写代理服务器".to_string()
+    } else if detail.contains("unsupported os") || detail.contains("unsupported country") {
+        format!("身份参数不受支持：{detail}")
+    } else if detail.is_empty() {
+        "命令执行失败".to_string()
+    } else {
+        detail
     }
 }
 
@@ -538,27 +578,7 @@ fn run_cli(args: &[&str]) -> Result<Value, String> {
         .trim()
         .to_string();
     if !status.success() {
-        let detail = format!("{}{}", stdout, stderr).trim().to_string();
-        let message = if detail.contains("could not draw a coherent identity") {
-            "暂时没有生成符合条件的指纹，请稍后重试".to_string()
-        } else if detail.contains("proxy mode requires") {
-            "代理模式需要选择节点或填写代理服务器".to_string()
-        } else if detail.contains("unsupported os") || detail.contains("unsupported country") {
-            format!("身份参数不受支持：{detail}")
-        } else {
-            detail
-        };
-        let label = match args.first() {
-            Some(&"create") => "创建命令失败",
-            Some(&"edit") => "保存失败",
-            Some(&"proxy-import") => "导入订阅失败",
-            Some(&"proxy-delete") => "删除订阅失败",
-            Some(&"proxy-set-core") => "设置内核失败",
-            Some(&"import") => "导入身份包失败",
-            Some(&"launch") => "启动失败",
-            _ => "命令执行失败",
-        };
-        return Err(format!("{label}：{message}"));
+        return Err(extract_cli_error(&stdout, &stderr));
     }
     if stdout.is_empty() {
         return Ok(Value::Null);
@@ -724,6 +744,33 @@ fn download_settings() -> runtime::DownloadSettings { runtime::download_settings
 #[tauri::command]
 fn save_download_settings(settings: runtime::DownloadSettings) -> Result<(), String> {
     runtime::save_download_settings(&project_root(), &settings)
+}
+
+#[tauri::command]
+async fn test_download_proxy(proxy: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || runtime::test_proxy(&proxy))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+async fn import_runtime_archive(path: String) -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        runtime::operation(|| runtime::import_archive(&project_root(), &path))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+fn open_runtime_downloads_dir() -> Result<Value, String> {
+    let dir = runtime::downloads_dir(&project_root());
+    std::fs::create_dir_all(&dir).map_err(|e| format!("无法创建下载缓存目录：{e}"))?;
+    Command::new("explorer")
+        .arg(&dir)
+        .spawn()
+        .map_err(|e| format!("无法打开下载缓存目录：{e}"))?;
+    Ok(serde_json::json!({ "dir": dir.display().to_string() }))
 }
 
 #[tauri::command]
@@ -1036,6 +1083,11 @@ async fn launch_identity(id: String) -> Result<Value, String> {
 #[tauri::command]
 async fn stop_identity(id: String) -> Result<Value, String> {
     run_cli_task(vec!["stop".into(), id]).await
+}
+
+#[tauri::command]
+async fn stop_all_identities() -> Result<Value, String> {
+    run_cli_task(vec!["stop-all".into()]).await
 }
 
 // ------------------------------------------------------- proxy subscriptions
@@ -1380,6 +1432,9 @@ pub fn run() {
             font_overview,
             download_settings,
             save_download_settings,
+            test_download_proxy,
+            import_runtime_archive,
+            open_runtime_downloads_dir,
             cancel_runtime,
             install_runtime,
             select_python,
@@ -1396,6 +1451,7 @@ pub fn run() {
             delete_identity,
             launch_identity,
             stop_identity,
+            stop_all_identities,
             system_proxy,
             proxy_sources,
             proxy_nodes,
@@ -1473,5 +1529,17 @@ HKEY_CURRENT_USER\\SOFTWARE\\Python\\PythonCore\\3.13\\InstallPath
         assert!(!is_windows_store_stub(&PathBuf::from(
             "C:\\Users\\alice\\AppData\\Local\\Programs\\Python\\Python312\\python.exe"
         )));
+    }
+
+    #[test]
+    fn cli_error_unwraps_json_payload_without_double_wrapping() {
+        assert_eq!(
+            extract_cli_error(r#"{"error": "环境正在运行中，请先停止后再导出"}"#, ""),
+            "环境正在运行中，请先停止后再导出"
+        );
+        assert_eq!(
+            extract_cli_error("", "ValueError: could not draw a coherent identity"),
+            "暂时没有生成符合条件的指纹，请稍后重试"
+        );
     }
 }

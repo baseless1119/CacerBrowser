@@ -342,10 +342,10 @@ def _candidate_cores(root: Path) -> List[Path]:
     local_app_data = os.environ.get("LOCALAPPDATA")
     if local_app_data:
         base = Path(local_app_data)
-        dirs.extend([base / "ShadowFox" / "mihomo", base / "ShadowFox", base / "mihomo"])
+        dirs.extend([base / "Cacer" / "mihomo", base / "Cacer", base / "ShadowFox" / "mihomo", base / "ShadowFox", base / "mihomo"])
     app_dir = os.environ.get("APPDATA")
     if app_dir:
-        dirs.append(Path(app_dir) / "ShadowFox" / "mihomo")
+        dirs.extend([Path(app_dir) / "Cacer" / "mihomo", Path(app_dir) / "ShadowFox" / "mihomo"])
     out: List[Path] = []
     for directory in dirs:
         for name in names:
@@ -926,7 +926,8 @@ def _spawn_core(
     creationflags = 0
     if os.name == "nt":
         creationflags = subprocess.CREATE_NO_WINDOW
-    log_file = open(log_path, "ab")
+    # Truncate mihomo.log on each fresh core start so logs never grow without bound.
+    log_file = open(log_path, "wb")
     try:
         proc = subprocess.Popen(
             [str(core), "-d", str(workdir), "-f", str(config_path)],

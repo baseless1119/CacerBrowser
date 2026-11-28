@@ -31,6 +31,13 @@ export interface ConfirmOptions {
   confirmLabel?: string;
   cancelLabel?: string;
   danger?: boolean;
+  checkboxLabel?: string;
+  checkboxDefault?: boolean;
+}
+
+export interface ConfirmResult {
+  confirmed: boolean;
+  checked: boolean;
 }
 
 export interface PromptField {
@@ -145,8 +152,9 @@ export function ConfirmDialog({
   onResult,
 }: {
   options: ConfirmOptions;
-  onResult: (accepted: boolean) => void;
+  onResult: (result: ConfirmResult) => void;
 }) {
+  const [checked, setChecked] = useState(Boolean(options.checkboxDefault));
   const tone: DialogTone = options.danger || options.tone === "danger"
     ? "error"
     : options.tone === "info"
@@ -154,23 +162,29 @@ export function ConfirmDialog({
       : "warning";
 
   return (
-    <TopDialog label={options.title} onCancel={() => onResult(false)}>
+    <TopDialog label={options.title} onCancel={() => onResult({ confirmed: false, checked: false })}>
       <div className="dialog-body">
         <span className={`dialog-badge tone-${tone}`}>{TONE_ICON[tone]}</span>
         <div className="dialog-copy">
           <h3>{options.title}</h3>
           <p className="dialog-text">{options.message}</p>
+          {options.checkboxLabel && (
+            <label className="dialog-checkbox">
+              <input type="checkbox" checked={checked} onChange={(e) => setChecked(e.target.checked)} />
+              <span>{options.checkboxLabel}</span>
+            </label>
+          )}
         </div>
       </div>
       <div className="dialog-footer">
-        <button type="button" className="secondary" onClick={() => onResult(false)}>
+        <button type="button" className="secondary" onClick={() => onResult({ confirmed: false, checked: false })}>
           {options.cancelLabel ?? "取消"}
         </button>
         <button
           type="button"
           className={options.danger ? "primary danger-primary" : "primary"}
           autoFocus
-          onClick={() => onResult(true)}
+          onClick={() => onResult({ confirmed: true, checked })}
         >
           {options.confirmLabel ?? "确定"}
         </button>
